@@ -100,7 +100,7 @@ fun EditorScreen(
     ) { uri -> if (uri != null) onAddPhotoFromUri(uri) }
 
     val cameraLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.TakePicture()
+        TakePictureWithPermission()
     ) { saved ->
         val file = captureFile
         captureFile = null
