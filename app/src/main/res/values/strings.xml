@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Journal</string>
+    <string name="widget_write">+ Write now</string>
+    <string name="widget_empty">No entries yet — tap to start</string>
+    <string name="widget_stats">%1$d day streak · %2$d entries · %3$d words</string>
+    <string name="widget_description">Write in your journal straight from the home screen</string>
+</resources>
