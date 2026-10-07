@@ -1,0 +1,4214 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Decide whether the project needs scaffolding
+        id: scaffold_check
+        run: |
+          if [ -f .journal-scaffolded ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------------
+      - name: Write Gradle project files
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Journal"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+              id("com.google.devtools.ksp") version "2.0.21-1.0.25" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > .gitignore <<'EOF'
+          *.iml
+          .gradle/
+          /local.properties
+          /.idea/
+          .DS_Store
+          /build
+          /app/build
+          /captures
+          .externalNativeBuild
+          .cxx
+          EOF
+
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+              id("com.google.devtools.ksp")
+          }
+
+          android {
+              namespace = "com.example.journal"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.journal"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      proguardFiles(
+                          getDefaultProguardFile("proguard-android-optimize.txt"),
+                          "proguard-rules.pro"
+                      )
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging {
+                  resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" }
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.03"))
+
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-process:2.8.6")
+
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-graphics")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+
+              implementation("androidx.room:room-runtime:2.6.1")
+              implementation("androidx.room:room-ktx:2.6.1")
+              ksp("androidx.room:room-compiler:2.6.1")
+
+              implementation("androidx.work:work-runtime-ktx:2.9.1")
+              implementation("androidx.exifinterface:exifinterface:1.3.7")
+
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          EOF
+
+          cat > app/proguard-rules.pro <<'EOF'
+          # Keep the default rules; nothing custom is required for this app.
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write manifest and resources
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          mkdir -p app/src/main/res/values app/src/main/res/xml app/src/main/res/layout app/src/main/res/drawable
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Deliberately NO internet permission: the journal cannot leave the device. -->
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:name=".JournalApplication"
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Journal">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:windowSoftInputMode="adjustResize"
+                      android:theme="@style/Theme.Journal">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+
+                  <receiver
+                      android:name=".widget.JournalWidgetProvider"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                          <action android:name="com.example.journal.WIDGET_REFRESH" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/widget_journal_info" />
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Journal</string>
+              <string name="widget_write">+ Write now</string>
+              <string name="widget_empty">No entries yet — tap to start</string>
+              <string name="widget_stats">%1$d day streak · %2$d entries · %3$d words</string>
+              <string name="widget_description">Write in your journal straight from the home screen</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/values/themes.xml <<'EOF'
+          <resources>
+              <style name="Theme.Journal" parent="android:Theme.Material.Light.NoActionBar" />
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths>
+              <cache-path name="camera" path="camera/" />
+          </paths>
+          EOF
+
+          cat > app/src/main/res/xml/widget_journal_info.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="180dp"
+              android:minHeight="110dp"
+              android:updatePeriodMillis="1800000"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen"
+              android:initialLayout="@layout/widget_journal"
+              android:description="@string/widget_description" />
+          EOF
+
+          cat > app/src/main/res/layout/widget_journal.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:background="@drawable/widget_background"
+              android:padding="14dp">
+
+              <TextView
+                  android:id="@+id/widget_title"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:text="@string/app_name"
+                  android:textColor="#FFF2F2F2"
+                  android:textSize="15sp"
+                  android:textStyle="bold" />
+
+              <TextView
+                  android:id="@+id/widget_stats"
+                  android:layout_width="match_parent"
+                  android:layout_height="0dp"
+                  android:layout_weight="1"
+                  android:gravity="center_vertical"
+                  android:text="@string/widget_empty"
+                  android:textColor="#FFBDBDBD"
+                  android:textSize="13sp" />
+
+              <TextView
+                  android:id="@+id/widget_action"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:background="@drawable/widget_button"
+                  android:gravity="center"
+                  android:paddingTop="9dp"
+                  android:paddingBottom="9dp"
+                  android:text="@string/widget_write"
+                  android:textColor="#FF0B1B33"
+                  android:textSize="14sp"
+                  android:textStyle="bold" />
+          </LinearLayout>
+          EOF
+
+          cat > app/src/main/res/drawable/widget_background.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#EE202124" />
+              <corners android:radius="20dp" />
+          </shape>
+          EOF
+
+          cat > app/src/main/res/drawable/widget_button.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <solid android:color="#FF8AB4F8" />
+              <corners android:radius="18dp" />
+          </shape>
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write crypto and data helpers
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/data
+          mkdir -p "$PKG"
+
+          cat > "$PKG/CryptoManager.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.util.Base64
+          import java.io.ByteArrayOutputStream
+          import java.security.SecureRandom
+          import javax.crypto.Cipher
+          import javax.crypto.SecretKey
+          import javax.crypto.SecretKeyFactory
+          import javax.crypto.spec.GCMParameterSpec
+          import javax.crypto.spec.PBEKeySpec
+          import javax.crypto.spec.SecretKeySpec
+
+          data class Encrypted(val cipherText: String, val iv: String)
+
+          object CryptoManager {
+
+              const val PBKDF2_ALGORITHM = "PBKDF2WithHmacSHA256"
+              const val TRANSFORMATION = "AES/GCM/NoPadding"
+              const val ITERATIONS = 210_000
+              const val IV_BYTES = 12
+
+              private const val KEY_BITS = 256
+              private const val SALT_BYTES = 16
+              private const val GCM_TAG_BITS = 128
+
+              private val random = SecureRandom()
+
+              fun newSalt(): ByteArray = ByteArray(SALT_BYTES).also(random::nextBytes)
+
+              private fun newIv(): ByteArray = ByteArray(IV_BYTES).also(random::nextBytes)
+
+              fun deriveKey(
+                  password: CharArray,
+                  salt: ByteArray,
+                  iterations: Int = ITERATIONS,
+              ): SecretKey {
+                  val spec = PBEKeySpec(password, salt, iterations, KEY_BITS)
+                  val factory = SecretKeyFactory.getInstance(PBKDF2_ALGORITHM)
+                  val bytes = factory.generateSecret(spec).encoded
+                  spec.clearPassword()
+                  return SecretKeySpec(bytes, "AES")
+              }
+
+              fun encrypt(key: SecretKey, plaintext: String): Encrypted {
+                  val iv = newIv()
+                  val cipher = Cipher.getInstance(TRANSFORMATION)
+                  cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+                  val body = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+                  return Encrypted(encode(body), encode(iv))
+              }
+
+              fun decrypt(key: SecretKey, cipherText: String, iv: String): String {
+                  val cipher = Cipher.getInstance(TRANSFORMATION)
+                  cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, decode(iv)))
+                  return String(cipher.doFinal(decode(cipherText)), Charsets.UTF_8)
+              }
+
+              /** Blob layout for attachments: [12-byte IV][GCM ciphertext]. */
+              fun encryptBytes(key: SecretKey, plain: ByteArray): ByteArray {
+                  val iv = newIv()
+                  val cipher = Cipher.getInstance(TRANSFORMATION)
+                  cipher.init(Cipher.ENCRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+                  val body = cipher.doFinal(plain)
+                  return ByteArrayOutputStream(iv.size + body.size).apply {
+                      write(iv)
+                      write(body)
+                  }.toByteArray()
+              }
+
+              fun decryptBytes(key: SecretKey, blob: ByteArray): ByteArray {
+                  require(blob.size > IV_BYTES) { "Attachment is truncated." }
+                  val iv = blob.copyOfRange(0, IV_BYTES)
+                  val body = blob.copyOfRange(IV_BYTES, blob.size)
+                  val cipher = Cipher.getInstance(TRANSFORMATION)
+                  cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
+                  return cipher.doFinal(body)
+              }
+
+              fun encode(bytes: ByteArray): String = Base64.encodeToString(bytes, Base64.NO_WRAP)
+              fun decode(text: String): ByteArray = Base64.decode(text, Base64.NO_WRAP)
+          }
+          EOF
+
+          cat > "$PKG/AuthManager.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import androidx.core.content.edit
+          import javax.crypto.SecretKey
+
+          /**
+           * Holds the derived key in memory for the current session and stores the
+           * salt plus an encrypted verifier blob used to check a password.
+           */
+          class AuthManager(context: Context) {
+
+              private val prefs: SharedPreferences =
+                  context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+              @Volatile
+              private var sessionKey: SecretKey? = null
+
+              val hasPassword: Boolean
+                  get() = prefs.contains(KEY_SALT) &&
+                          prefs.contains(KEY_VERIFIER) &&
+                          prefs.contains(KEY_VERIFIER_IV)
+
+              fun currentKey(): SecretKey = sessionKey ?: error("Journal is locked")
+              fun currentKeyOrNull(): SecretKey? = sessionKey
+
+              /** The PBKDF2 salt. Backups include it so a file can be opened elsewhere. */
+              fun saltCopy(): ByteArray? =
+                  prefs.getString(KEY_SALT, null)?.let(CryptoManager::decode)
+
+              fun setupPassword(password: CharArray): Boolean {
+                  if (hasPassword) return false
+                  val salt = CryptoManager.newSalt()
+                  val key = CryptoManager.deriveKey(password, salt)
+                  writeVerifier(salt, key)
+                  sessionKey = key
+                  return true
+              }
+
+              fun unlock(password: CharArray): Boolean {
+                  val salt = prefs.getString(KEY_SALT, null)?.let(CryptoManager::decode) ?: return false
+                  val verifier = prefs.getString(KEY_VERIFIER, null) ?: return false
+                  val iv = prefs.getString(KEY_VERIFIER_IV, null) ?: return false
+
+                  val candidate = CryptoManager.deriveKey(password, salt)
+                  val ok = try {
+                      CryptoManager.decrypt(candidate, verifier, iv) == VERIFIER_TEXT
+                  } catch (t: Throwable) {
+                      false
+                  }
+                  if (ok) sessionKey = candidate
+                  return ok
+              }
+
+              /** Used after a password change, when every entry has been re-encrypted. */
+              fun replacePassword(newSalt: ByteArray, newKey: SecretKey) {
+                  writeVerifier(newSalt, newKey)
+                  sessionKey = newKey
+              }
+
+              fun lock() {
+                  sessionKey = null
+              }
+
+              private fun writeVerifier(salt: ByteArray, key: SecretKey) {
+                  val verifier = CryptoManager.encrypt(key, VERIFIER_TEXT)
+                  prefs.edit(commit = true) {
+                      putString(KEY_SALT, CryptoManager.encode(salt))
+                      putString(KEY_VERIFIER, verifier.cipherText)
+                      putString(KEY_VERIFIER_IV, verifier.iv)
+                  }
+              }
+
+              private companion object {
+                  const val PREFS_NAME = "journal_auth"
+                  const val KEY_SALT = "salt"
+                  const val KEY_VERIFIER = "verifier"
+                  const val KEY_VERIFIER_IV = "verifier_iv"
+                  const val VERIFIER_TEXT = "journal-unlock-check-v1"
+              }
+          }
+          EOF
+
+          cat > "$PKG/Payload.kt" <<'EOF'
+          package com.example.journal.data
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /**
+           * Everything encrypted for one entry. Mood, the hidden flag and the list of
+           * encrypted photo filenames all live in here, so none of them is plaintext
+           * on disk.
+           */
+          data class EntryPayload(
+              val text: String,
+              val mood: String? = null,
+              val locked: Boolean = false,
+              val attachments: List<String> = emptyList(),
+          )
+
+          object PayloadCodec {
+
+              fun encode(payload: EntryPayload): String = JSONObject().apply {
+                  put("v", 3)
+                  put("text", payload.text)
+                  payload.mood?.let { put("mood", it) }
+                  if (payload.locked) put("locked", true)
+                  if (payload.attachments.isNotEmpty()) {
+                      put("attachments", JSONArray(payload.attachments))
+                  }
+              }.toString()
+
+              /** Tolerates rows written before this format existed (raw text). */
+              fun decode(raw: String): EntryPayload {
+                  if (!raw.trimStart().startsWith("{")) return EntryPayload(raw)
+                  return try {
+                      val json = JSONObject(raw)
+                      if (!json.has("text")) return EntryPayload(raw)
+                      val attachments = json.optJSONArray("attachments")?.let { array ->
+                          (0 until array.length())
+                              .mapNotNull { array.optString(it).takeIf(String::isNotBlank) }
+                      } ?: emptyList()
+                      EntryPayload(
+                          text = json.optString("text"),
+                          mood = json.optString("mood").takeIf { it.isNotBlank() && !json.isNull("mood") },
+                          locked = json.optBoolean("locked", false),
+                          attachments = attachments,
+                      )
+                  } catch (t: Throwable) {
+                      EntryPayload(raw)
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/Tags.kt" <<'EOF'
+          package com.example.journal.data
+
+          /** Finds #tags anywhere in an entry. Letters, digits, underscore and dash. */
+          object TagParser {
+
+              private val tagRegex = Regex("""(?:^|\s)#([\p{L}\p{N}_-]{1,32})""")
+
+              fun tagsOf(text: String): List<String> =
+                  tagRegex.findAll(text)
+                      .map { it.groupValues[1].lowercase() }
+                      .distinct()
+                      .toList()
+          }
+          EOF
+
+          cat > "$PKG/AttachmentStore.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import java.io.File
+          import java.util.UUID
+          import javax.crypto.SecretKey
+
+          /**
+           * Encrypted photo files live in filesDir/attachments as [IV][ciphertext].
+           * Nothing writes a decrypted copy to disk: pictures are decrypted in memory
+           * only, at the moment they are displayed.
+           */
+          class AttachmentStore(private val context: Context) {
+
+              private val directory: File
+                  get() = File(context.filesDir, "attachments").apply { if (!exists()) mkdirs() }
+
+              fun save(key: SecretKey, bytes: ByteArray): String {
+                  val name = UUID.randomUUID().toString().replace("-", "") + ".bin"
+                  File(directory, name).writeBytes(CryptoManager.encryptBytes(key, bytes))
+                  return name
+              }
+
+              fun load(key: SecretKey, name: String): ByteArray? {
+                  val file = File(directory, name)
+                  if (!file.isFile) return null
+                  return runCatching { CryptoManager.decryptBytes(key, file.readBytes()) }.getOrNull()
+              }
+
+              fun delete(name: String) {
+                  File(directory, name).delete()
+              }
+
+              /**
+               * Deletes files no entry points at any more. Files younger than
+               * [minAgeMillis] are left alone, so a picture attached to an entry that
+               * is still open in the editor can never be swept away.
+               */
+              fun collectGarbage(referenced: Set<String>, minAgeMillis: Long = 60L * 60L * 1000L): Int {
+                  val cutoff = System.currentTimeMillis() - minAgeMillis
+                  var deleted = 0
+                  directory.listFiles()?.forEach { file ->
+                      if (file.name !in referenced && file.lastModified() < cutoff) {
+                          if (file.delete()) deleted++
+                      }
+                  }
+                  return deleted
+              }
+          }
+          EOF
+
+          cat > "$PKG/ImageCompressor.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Matrix
+          import androidx.exifinterface.media.ExifInterface
+          import java.io.ByteArrayInputStream
+          import java.io.ByteArrayOutputStream
+
+          /**
+           * Shrinks a picture before it is encrypted. Photos are resized to at most
+           * [MAX_DIMENSION] on the long edge and JPEG compressed, which keeps the
+           * journal small enough to back up as one file.
+           */
+          object ImageCompressor {
+
+              private const val MAX_DIMENSION = 1280
+              private const val QUALITY = 75
+
+              fun fromBytes(raw: ByteArray): ByteArray? {
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+                  if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+                  var sample = 1
+                  while (bounds.outWidth / (sample * 2) >= MAX_DIMENSION &&
+                      bounds.outHeight / (sample * 2) >= MAX_DIMENSION
+                  ) {
+                      sample *= 2
+                  }
+
+                  val options = BitmapFactory.Options().apply { inSampleSize = sample }
+                  val decoded = BitmapFactory.decodeByteArray(raw, 0, raw.size, options) ?: return null
+
+                  val rotation = runCatching {
+                      ByteArrayInputStream(raw).use { readRotation(ExifInterface(it)) }
+                  }.getOrDefault(0)
+
+                  val scaled = scaleDown(decoded, MAX_DIMENSION)
+                  val oriented = if (rotation == 0) scaled else applyRotation(scaled, rotation)
+
+                  val out = ByteArrayOutputStream()
+                  oriented.compress(Bitmap.CompressFormat.JPEG, QUALITY, out)
+                  return out.toByteArray()
+              }
+
+              private fun readRotation(exif: ExifInterface): Int =
+                  when (exif.getAttributeInt(
+                      ExifInterface.TAG_ORIENTATION,
+                      ExifInterface.ORIENTATION_NORMAL,
+                  )) {
+                      ExifInterface.ORIENTATION_ROTATE_90 -> 90
+                      ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                      ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                      else -> 0
+                  }
+
+              private fun scaleDown(bitmap: Bitmap, maxDimension: Int): Bitmap {
+                  val largest = maxOf(bitmap.width, bitmap.height)
+                  if (largest <= maxDimension) return bitmap
+                  val ratio = maxDimension.toFloat() / largest
+                  return Bitmap.createScaledBitmap(
+                      bitmap,
+                      (bitmap.width * ratio).toInt().coerceAtLeast(1),
+                      (bitmap.height * ratio).toInt().coerceAtLeast(1),
+                      true,
+                  )
+              }
+
+              private fun applyRotation(bitmap: Bitmap, degrees: Int): Bitmap {
+                  val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+                  return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write database layer
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/data
+
+          cat > "$PKG/Entry.kt" <<'EOF'
+          package com.example.journal.data
+
+          import androidx.room.ColumnInfo
+          import androidx.room.Entity
+          import androidx.room.PrimaryKey
+
+          @Entity(tableName = "entries")
+          data class Entry(
+              @PrimaryKey(autoGenerate = true)
+              val id: Long = 0L,
+
+              /** Local calendar day the entry belongs to, ISO-8601 (yyyy-MM-dd). */
+              @ColumnInfo(name = "entry_date")
+              val entryDate: String,
+
+              /** Wall-clock moment the text was first written. Hidden by default. */
+              @ColumnInfo(name = "created_at")
+              val createdAt: Long,
+
+              /** Last edit time. */
+              @ColumnInfo(name = "updated_at")
+              val updatedAt: Long,
+
+              /** AES-256-GCM ciphertext, Base64 (NO_WRAP). */
+              @ColumnInfo(name = "cipher_text")
+              val cipherText: String,
+
+              /** 12-byte GCM nonce, Base64 (NO_WRAP). */
+              @ColumnInfo(name = "iv")
+              val iv: String,
+          )
+          EOF
+
+          cat > "$PKG/JournalEntry.kt" <<'EOF'
+          package com.example.journal.data
+
+          import java.time.LocalDate
+
+          /** Decrypted, in-memory representation of an entry. */
+          data class JournalEntry(
+              val id: Long,
+              val date: LocalDate,
+              val createdAt: Long,
+              val updatedAt: Long,
+              val text: String,
+              val mood: String? = null,
+              val locked: Boolean = false,
+              val attachments: List<String> = emptyList(),
+              val tags: List<String> = emptyList(),
+          )
+          EOF
+
+          cat > "$PKG/EntryDao.kt" <<'EOF'
+          package com.example.journal.data
+
+          import androidx.room.Dao
+          import androidx.room.Insert
+          import androidx.room.Query
+          import androidx.room.Update
+          import kotlinx.coroutines.flow.Flow
+
+          @Dao
+          interface EntryDao {
+
+              @Query("SELECT * FROM entries ORDER BY entry_date DESC, created_at ASC")
+              fun observeAll(): Flow<List<Entry>>
+
+              @Query("SELECT * FROM entries ORDER BY entry_date DESC, created_at ASC")
+              suspend fun getAll(): List<Entry>
+
+              @Query("SELECT * FROM entries WHERE id = :id LIMIT 1")
+              suspend fun getById(id: Long): Entry?
+
+              @Insert
+              suspend fun insert(entry: Entry): Long
+
+              @Insert
+              suspend fun insertAll(entries: List<Entry>): List<Long>
+
+              @Update
+              suspend fun update(entry: Entry)
+
+              @Update
+              suspend fun updateAll(entries: List<Entry>)
+
+              @Query("DELETE FROM entries WHERE id = :id")
+              suspend fun deleteById(id: Long)
+          }
+          EOF
+
+          cat > "$PKG/JournalDatabase.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import androidx.room.Database
+          import androidx.room.Room
+          import androidx.room.RoomDatabase
+
+          @Database(entities = [Entry::class], version = 1, exportSchema = false)
+          abstract class JournalDatabase : RoomDatabase() {
+
+              abstract fun entryDao(): EntryDao
+
+              companion object {
+                  fun build(context: Context): JournalDatabase =
+                      Room.databaseBuilder(
+                          context.applicationContext,
+                          JournalDatabase::class.java,
+                          "journal.db",
+                      ).build()
+              }
+          }
+          EOF
+
+          cat > "$PKG/EntryRepository.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.room.withTransaction
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.time.LocalDate
+
+          class EntryRepository(
+              private val dao: EntryDao,
+              private val auth: AuthManager,
+              private val database: JournalDatabase,
+              private val context: Context,
+              private val attachments: AttachmentStore = AttachmentStore(context),
+          ) {
+
+              fun observeEntries(): Flow<List<JournalEntry>> = dao.observeAll().map(::decryptAll)
+
+              private fun decryptAll(rows: List<Entry>): List<JournalEntry> {
+                  val key = auth.currentKeyOrNull() ?: return emptyList()
+                  return rows.mapNotNull { row ->
+                      runCatching {
+                          val payload = PayloadCodec.decode(
+                              CryptoManager.decrypt(key, row.cipherText, row.iv)
+                          )
+                          JournalEntry(
+                              id = row.id,
+                              date = LocalDate.parse(row.entryDate),
+                              createdAt = row.createdAt,
+                              updatedAt = row.updatedAt,
+                              text = payload.text,
+                              mood = payload.mood,
+                              locked = payload.locked,
+                              attachments = payload.attachments,
+                              tags = TagParser.tagsOf(payload.text),
+                          )
+                      }.getOrNull()
+                  }
+              }
+
+              suspend fun save(
+                  id: Long?,
+                  date: LocalDate,
+                  text: String,
+                  mood: String?,
+                  locked: Boolean,
+                  attachmentNames: List<String>,
+              ): Long {
+                  val key = auth.currentKey()
+                  val payload = EntryPayload(text, mood, locked, attachmentNames)
+                  val encrypted = CryptoManager.encrypt(key, PayloadCodec.encode(payload))
+                  val now = System.currentTimeMillis()
+
+                  if (id == null) {
+                      return dao.insert(
+                          Entry(
+                              entryDate = date.toString(),
+                              createdAt = now,
+                              updatedAt = now,
+                              cipherText = encrypted.cipherText,
+                              iv = encrypted.iv,
+                          )
+                      )
+                  }
+
+                  val existing = dao.getById(id) ?: return -1L
+                  val previous = runCatching {
+                      PayloadCodec.decode(CryptoManager.decrypt(key, existing.cipherText, existing.iv))
+                  }.getOrNull()
+
+                  dao.update(
+                      existing.copy(
+                          entryDate = date.toString(),
+                          updatedAt = now,
+                          cipherText = encrypted.cipherText,
+                          iv = encrypted.iv,
+                      )
+                  )
+
+                  // Forget the pictures the user removed while editing.
+                  previous?.attachments
+                      ?.minus(attachmentNames.toSet())
+                      ?.forEach { attachments.delete(it) }
+
+                  return id
+              }
+
+              suspend fun delete(id: Long) {
+                  val row = dao.getById(id) ?: return
+                  auth.currentKeyOrNull()?.let { key ->
+                      runCatching {
+                          PayloadCodec.decode(CryptoManager.decrypt(key, row.cipherText, row.iv))
+                      }.getOrNull()?.attachments?.forEach { attachments.delete(it) }
+                  }
+                  dao.deleteById(id)
+              }
+
+              suspend fun addAttachment(bytes: ByteArray): String? = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext null
+                  runCatching { attachments.save(key, bytes) }.getOrNull()
+              }
+
+              suspend fun loadAttachment(name: String): ByteArray? = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext null
+                  attachments.load(key, name)
+              }
+
+              /** Sweeps pictures no entry references any more. Safe to call repeatedly. */
+              suspend fun cleanUpAttachments(): Int = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext 0
+                  val referenced = dao.getAll().flatMapTo(mutableSetOf()) { row ->
+                      runCatching {
+                          PayloadCodec.decode(CryptoManager.decrypt(key, row.cipherText, row.iv))
+                      }.getOrDefault(EntryPayload("")).attachments
+                  }
+                  attachments.collectGarbage(referenced)
+              }
+
+              /**
+               * Verifies [current], then decrypts every entry with the old key and
+               * re-encrypts it with a key derived from [new]. All-or-nothing.
+               */
+              suspend fun changePassword(current: CharArray, new: CharArray): Boolean {
+                  if (!auth.unlock(current)) return false
+
+                  val oldKey = auth.currentKey()
+                  val rows = dao.getAll()
+
+                  val newSalt = CryptoManager.newSalt()
+                  val newKey = CryptoManager.deriveKey(new, newSalt)
+
+                  val reEncrypted = rows.map { row ->
+                      val plain = CryptoManager.decrypt(oldKey, row.cipherText, row.iv)
+                      val encrypted = CryptoManager.encrypt(newKey, plain)
+                      row.copy(cipherText = encrypted.cipherText, iv = encrypted.iv)
+                  }
+
+                  database.withTransaction { dao.updateAll(reEncrypted) }
+                  auth.replacePassword(newSalt, newKey)
+                  return true
+              }
+
+              // ------------------------------------------------------------ backup
+
+              /** Writes a single self-contained encrypted backup. Returns the entry count. */
+              suspend fun exportTo(uri: Uri): Int = withContext(Dispatchers.IO) {
+                  val key = auth.currentKey()
+                  val salt = auth.saltCopy() ?: error("The journal has no password set.")
+                  val rows = dao.getAll()
+
+                  val entriesJson = JSONArray()
+                  rows.forEach { row ->
+                      val payload = PayloadCodec.decode(
+                          CryptoManager.decrypt(key, row.cipherText, row.iv)
+                      )
+
+                      val photosJson = JSONArray()
+                      payload.attachments.forEach { name ->
+                          attachments.load(key, name)?.let { bytes ->
+                              photosJson.put(
+                                  JSONObject().apply {
+                                      put("name", name)
+                                      put("data", CryptoManager.encode(bytes))
+                                  }
+                              )
+                          }
+                      }
+
+                      entriesJson.put(
+                          JSONObject().apply {
+                              put("date", row.entryDate)
+                              put("createdAt", row.createdAt)
+                              put("updatedAt", row.updatedAt)
+                              put("text", payload.text)
+                              payload.mood?.let { put("mood", it) }
+                              if (payload.locked) put("locked", true)
+                              if (photosJson.length() > 0) put("attachments", photosJson)
+                          }
+                      )
+                  }
+
+                  val inner = JSONObject().apply {
+                      put("version", 3)
+                      put("entries", entriesJson)
+                  }.toString()
+
+                  val encrypted = CryptoManager.encrypt(key, inner)
+
+                  val envelope = JSONObject().apply {
+                      put("app", "journal")
+                      put("version", 3)
+                      put("exportedAt", System.currentTimeMillis())
+                      put("kdf", JSONObject().apply {
+                          put("algo", CryptoManager.PBKDF2_ALGORITHM)
+                          put("iterations", CryptoManager.ITERATIONS)
+                          put("salt", CryptoManager.encode(salt))
+                      })
+                      put("cipher", JSONObject().apply {
+                          put("algo", CryptoManager.TRANSFORMATION)
+                          put("iv", encrypted.iv)
+                          put("data", encrypted.cipherText)
+                      })
+                  }.toString(2)
+
+                  context.contentResolver.openOutputStream(uri).use { stream ->
+                      if (stream == null) error("Could not open the destination file.")
+                      stream.write(envelope.toByteArray(Charsets.UTF_8))
+                  }
+                  rows.size
+              }
+
+              /**
+               * Reads a backup, decrypting it with [password] against the salt stored
+               * in the file, then re-encrypts everything under the current journal key.
+               */
+              suspend fun importFrom(uri: Uri, password: CharArray): Int = withContext(Dispatchers.IO) {
+                  val fileText = context.contentResolver.openInputStream(uri)?.use {
+                      it.readBytes().toString(Charsets.UTF_8)
+                  } ?: error("Could not read that file.")
+
+                  val envelope = runCatching { JSONObject(fileText) }
+                      .getOrElse { error("That file isn't a readable Journal backup.") }
+                  require(envelope.optString("app") == "journal") { "That file isn't a Journal backup." }
+
+                  val kdf = envelope.getJSONObject("kdf")
+                  val cipher = envelope.getJSONObject("cipher")
+                  val salt = CryptoManager.decode(kdf.getString("salt"))
+                  val iterations = kdf.optInt("iterations", CryptoManager.ITERATIONS)
+
+                  val fileKey = CryptoManager.deriveKey(password, salt, iterations)
+                  val inner = runCatching {
+                      CryptoManager.decrypt(fileKey, cipher.getString("data"), cipher.getString("iv"))
+                  }.getOrElse { error("Wrong password for this backup, or the file is damaged.") }
+
+                  val incoming = runCatching { JSONObject(inner).getJSONArray("entries") }
+                      .getOrElse { error("This backup looks corrupted inside.") }
+
+                  val currentKey = auth.currentKey()
+                  val now = System.currentTimeMillis()
+
+                  val rows = buildList {
+                      for (i in 0 until incoming.length()) {
+                          val item = incoming.getJSONObject(i)
+                          val date = runCatching { LocalDate.parse(item.getString("date")) }
+                              .getOrNull() ?: continue
+                          val text = item.optString("text")
+                          if (text.isBlank()) continue
+                          val mood = if (item.isNull("mood")) null
+                          else item.optString("mood").ifBlank { null }
+
+                          val photos = item.optJSONArray("attachments")
+                          val names = buildList {
+                              if (photos != null) {
+                                  for (p in 0 until photos.length()) {
+                                      val photo = photos.getJSONObject(p)
+                                      val bytes = runCatching {
+                                          CryptoManager.decode(photo.getString("data"))
+                                      }.getOrNull() ?: continue
+                                      runCatching { attachments.save(currentKey, bytes) }
+                                          .getOrNull()?.let { add(it) }
+                                  }
+                              }
+                          }
+
+                          val encrypted = CryptoManager.encrypt(
+                              currentKey,
+                              PayloadCodec.encode(
+                                  EntryPayload(
+                                      text = text,
+                                      mood = mood,
+                                      locked = item.optBoolean("locked", false),
+                                      attachments = names,
+                                  )
+                              ),
+                          )
+
+                          add(
+                              Entry(
+                                  entryDate = date.toString(),
+                                  createdAt = item.optLong("createdAt", now),
+                                  updatedAt = item.optLong("updatedAt", now),
+                                  cipherText = encrypted.cipherText,
+                                  iv = encrypted.iv,
+                              )
+                          )
+                      }
+                  }
+
+                  if (rows.isNotEmpty()) dao.insertAll(rows)
+                  rows.size
+              }
+          }
+          EOF
+
+          cat > "$PKG/SettingsStore.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import androidx.core.content.edit
+
+          class SettingsStore(context: Context) {
+
+              private val prefs = context.applicationContext
+                  .getSharedPreferences("journal_settings", Context.MODE_PRIVATE)
+
+              /** Whether the "Recorded <timestamp>" metadata is visible in the list. */
+              var revealRecordedTimes: Boolean
+                  get() = prefs.getBoolean(KEY_REVEAL, false)
+                  set(value) = prefs.edit { putBoolean(KEY_REVEAL, value) }
+
+              var reminderEnabled: Boolean
+                  get() = prefs.getBoolean(KEY_REMINDER_ENABLED, false)
+                  set(value) = prefs.edit { putBoolean(KEY_REMINDER_ENABLED, value) }
+
+              var reminderHour: Int
+                  get() = prefs.getInt(KEY_REMINDER_HOUR, 20)
+                  set(value) = prefs.edit { putInt(KEY_REMINDER_HOUR, value) }
+
+              var reminderMinute: Int
+                  get() = prefs.getInt(KEY_REMINDER_MINUTE, 30)
+                  set(value) = prefs.edit { putInt(KEY_REMINDER_MINUTE, value) }
+
+              private companion object {
+                  const val KEY_REVEAL = "reveal_recorded_times"
+                  const val KEY_REMINDER_ENABLED = "reminder_enabled"
+                  const val KEY_REMINDER_HOUR = "reminder_hour"
+                  const val KEY_REMINDER_MINUTE = "reminder_minute"
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write application, view model and activity
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal
+          mkdir -p "$PKG"
+
+          cat > "$PKG/JournalApplication.kt" <<'EOF'
+          package com.example.journal
+
+          import android.app.Application
+          import com.example.journal.data.AuthManager
+          import com.example.journal.data.EntryRepository
+          import com.example.journal.data.JournalDatabase
+          import com.example.journal.data.SettingsStore
+          import com.example.journal.work.Notifications
+
+          class JournalApplication : Application() {
+
+              val authManager: AuthManager by lazy { AuthManager(this) }
+              val settingsStore: SettingsStore by lazy { SettingsStore(this) }
+              val database: JournalDatabase by lazy { JournalDatabase.build(this) }
+              val repository: EntryRepository by lazy {
+                  EntryRepository(database.entryDao(), authManager, database, this)
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  Notifications.ensureChannel(this)
+              }
+          }
+          EOF
+
+          cat > "$PKG/JournalViewModel.kt" <<'EOF'
+          package com.example.journal
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.lifecycle.ViewModel
+          import androidx.lifecycle.ViewModelProvider
+          import androidx.lifecycle.viewModelScope
+          import com.example.journal.data.AuthManager
+          import com.example.journal.data.EntryRepository
+          import com.example.journal.data.ImageCompressor
+          import com.example.journal.data.JournalEntry
+          import com.example.journal.data.SettingsStore
+          import com.example.journal.ui.JournalStats
+          import com.example.journal.ui.OnThisDayHit
+          import com.example.journal.ui.computeOnThisDay
+          import com.example.journal.ui.computeStats
+          import com.example.journal.ui.decodeSampled
+          import com.example.journal.widget.JournalWidget
+          import com.example.journal.work.ReminderScheduler
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.ExperimentalCoroutinesApi
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.SharingStarted
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.flatMapLatest
+          import kotlinx.coroutines.flow.flowOf
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.flow.stateIn
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.time.LocalDate
+
+          sealed interface LockState {
+              data object NeedsSetup : LockState
+              data object Locked : LockState
+              data object Unlocked : LockState
+          }
+
+          /**
+           * The entry open in the editor. It lives here rather than in the composable
+           * so a background auto-lock never throws away unsaved text.
+           */
+          data class EditorState(
+              val entryId: Long?,
+              val originalText: String,
+              val originalDate: LocalDate,
+              val originalMood: String?,
+              val originalLocked: Boolean,
+              val originalAttachments: List<String>,
+              val text: String,
+              val date: LocalDate,
+              val mood: String?,
+              val locked: Boolean,
+              val attachments: List<String>,
+              val createdAt: Long? = null,
+              val updatedAt: Long? = null,
+          ) {
+              val isNew: Boolean get() = entryId == null
+              val isDirty: Boolean
+                  get() = text != originalText ||
+                          date != originalDate ||
+                          mood != originalMood ||
+                          locked != originalLocked ||
+                          attachments != originalAttachments
+          }
+
+          data class ReminderSettings(val enabled: Boolean, val hour: Int, val minute: Int)
+
+          data class UiMessage(val id: Long, val text: String)
+
+          @OptIn(ExperimentalCoroutinesApi::class)
+          class JournalViewModel(
+              private val repository: EntryRepository,
+              private val auth: AuthManager,
+              private val settings: SettingsStore,
+              private val appContext: Context,
+          ) : ViewModel() {
+
+              private val _lockState = MutableStateFlow<LockState>(
+                  if (auth.hasPassword) LockState.Locked else LockState.NeedsSetup
+              )
+              val lockState: StateFlow<LockState> = _lockState.asStateFlow()
+
+              private val _authError = MutableStateFlow<String?>(null)
+              val authError: StateFlow<String?> = _authError.asStateFlow()
+
+              private val _authBusy = MutableStateFlow(false)
+              val authBusy: StateFlow<Boolean> = _authBusy.asStateFlow()
+
+              private val _editor = MutableStateFlow<EditorState?>(null)
+              val editor: StateFlow<EditorState?> = _editor.asStateFlow()
+
+              private val _revealedEntries = MutableStateFlow<Set<Long>>(emptySet())
+              val revealedEntries: StateFlow<Set<Long>> = _revealedEntries.asStateFlow()
+
+              private val _revealRecordedTimes = MutableStateFlow(settings.revealRecordedTimes)
+              val revealRecordedTimes: StateFlow<Boolean> = _revealRecordedTimes.asStateFlow()
+
+              private val _reminder = MutableStateFlow(
+                  ReminderSettings(settings.reminderEnabled, settings.reminderHour, settings.reminderMinute)
+              )
+              val reminder: StateFlow<ReminderSettings> = _reminder.asStateFlow()
+
+              private val _message = MutableStateFlow<UiMessage?>(null)
+              val message: StateFlow<UiMessage?> = _message.asStateFlow()
+
+              private val _transferInProgress = MutableStateFlow(false)
+              val transferInProgress: StateFlow<Boolean> = _transferInProgress.asStateFlow()
+
+              private var pendingLock: Job? = null
+              private var pendingNewEntry = false
+
+              /** Small decoded thumbnails, most recently used last so they can evict. */
+              private val thumbnails = object : LinkedHashMap<String, ImageBitmap>(16, 0.75f, true) {
+                  override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>?) =
+                      size > 64
+              }
+
+              val entries: StateFlow<List<JournalEntry>> = _lockState
+                  .flatMapLatest { state ->
+                      if (state == LockState.Unlocked) repository.observeEntries() else flowOf(emptyList())
+                  }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+              val stats: StateFlow<JournalStats> = entries
+                  .map { computeStats(it) }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, JournalStats())
+
+              val onThisDay: StateFlow<List<OnThisDayHit>> = entries
+                  .map { computeOnThisDay(it, LocalDate.now()) }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+              init {
+                  viewModelScope.launch {
+                      stats.collect { current ->
+                          if (_lockState.value == LockState.Unlocked && current.entries > 0) {
+                              JournalWidget.push(appContext, current)
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------ locking
+
+              fun setupPassword(password: String, confirm: String) {
+                  val error = when {
+                      password.length < MIN_PASSWORD_LENGTH -> "Use at least $MIN_PASSWORD_LENGTH characters."
+                      password != confirm -> "Those passwords don't match."
+                      else -> null
+                  }
+                  if (error != null) {
+                      _authError.value = error
+                      return
+                  }
+
+                  _authBusy.value = true
+                  viewModelScope.launch {
+                      val created = withContext(Dispatchers.Default) {
+                          auth.setupPassword(password.toCharArray())
+                      }
+                      _authBusy.value = false
+                      if (!created) {
+                          _authError.value = "This journal already has a password."
+                          return@launch
+                      }
+                      _authError.value = null
+                      _lockState.value = LockState.Unlocked
+                      afterUnlock()
+                  }
+              }
+
+              fun unlock(password: String) {
+                  _authBusy.value = true
+                  viewModelScope.launch {
+                      val ok = withContext(Dispatchers.Default) {
+                          auth.unlock(password.toCharArray())
+                      }
+                      _authBusy.value = false
+                      _authError.value = if (ok) null else "Wrong password."
+                      if (ok) {
+                          _lockState.value = LockState.Unlocked
+                          afterUnlock()
+                      }
+                  }
+              }
+
+              /** Cheap re-check used by the per-entry lock. Does not change lock state. */
+              fun revealEntry(entryId: Long, password: String, onResult: (Boolean) -> Unit) {
+                  viewModelScope.launch {
+                      val ok = withContext(Dispatchers.Default) {
+                          auth.unlock(password.toCharArray())
+                      }
+                      if (ok) _revealedEntries.update { it + entryId }
+                      onResult(ok)
+                  }
+              }
+
+              private fun afterUnlock() {
+                  if (pendingNewEntry) {
+                      pendingNewEntry = false
+                      openNewEntry()
+                  }
+                  viewModelScope.launch { repository.cleanUpAttachments() }
+              }
+
+              fun requestNewEntry() {
+                  if (_lockState.value == LockState.Unlocked) openNewEntry() else pendingNewEntry = true
+              }
+
+              fun lock() {
+                  if (_lockState.value != LockState.Unlocked) return
+                  pendingLock?.cancel()
+                  pendingLock = null
+                  auth.lock()
+                  _revealedEntries.value = emptySet()
+                  thumbnails.clear()
+                  _lockState.value = LockState.Locked
+              }
+
+              fun scheduleLock(delayMillis: Long = AUTO_LOCK_DELAY_MILLIS) {
+                  if (_lockState.value != LockState.Unlocked) return
+                  pendingLock?.cancel()
+                  pendingLock = viewModelScope.launch {
+                      delay(delayMillis)
+                      lock()
+                  }
+              }
+
+              fun cancelPendingLock() {
+                  pendingLock?.cancel()
+                  pendingLock = null
+              }
+
+              // ------------------------------------------------------------- editor
+
+              fun openNewEntry(date: LocalDate = LocalDate.now()) {
+                  _editor.value = EditorState(
+                      entryId = null,
+                      originalText = "",
+                      originalDate = date,
+                      originalMood = null,
+                      originalLocked = false,
+                      originalAttachments = emptyList(),
+                      text = "",
+                      date = date,
+                      mood = null,
+                      locked = false,
+                      attachments = emptyList(),
+                  )
+              }
+
+              fun openEntry(entry: JournalEntry) {
+                  _editor.value = EditorState(
+                      entryId = entry.id,
+                      originalText = entry.text,
+                      originalDate = entry.date,
+                      originalMood = entry.mood,
+                      originalLocked = entry.locked,
+                      originalAttachments = entry.attachments,
+                      text = entry.text,
+                      date = entry.date,
+                      mood = entry.mood,
+                      locked = entry.locked,
+                      attachments = entry.attachments,
+                      createdAt = entry.createdAt,
+                      updatedAt = entry.updatedAt,
+                  )
+              }
+
+              fun updateDraft(text: String? = null, date: LocalDate? = null) {
+                  _editor.update { current ->
+                      if (current == null) null
+                      else current.copy(text = text ?: current.text, date = date ?: current.date)
+                  }
+              }
+
+              fun setMood(mood: String?) {
+                  _editor.update { it?.copy(mood = mood) }
+              }
+
+              fun toggleDraftLock() {
+                  _editor.update { it?.copy(locked = !it.locked) }
+              }
+
+              fun removePhoto(name: String) {
+                  _editor.update { it?.copy(attachments = it.attachments - name) }
+              }
+
+              fun closeEditor() {
+                  _editor.value = null
+              }
+
+              fun saveDraft() {
+                  val draft = _editor.value ?: return
+                  if (draft.text.isBlank()) return
+                  viewModelScope.launch {
+                      repository.save(
+                          id = draft.entryId,
+                          date = draft.date,
+                          text = draft.text.trim(),
+                          mood = draft.mood,
+                          locked = draft.locked,
+                          attachmentNames = draft.attachments,
+                      )
+                      _editor.value = null
+                  }
+              }
+
+              fun deleteEntry(id: Long) {
+                  viewModelScope.launch {
+                      repository.delete(id)
+                      if (_editor.value?.entryId == id) _editor.value = null
+                  }
+              }
+
+              // --------------------------------------------------------------- photos
+
+              fun addPhotoFromUri(uri: Uri) {
+                  ingestPhoto {
+                      withContext(Dispatchers.IO) {
+                          appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                      }
+                  }
+              }
+
+              fun addPhotoFromFile(file: File) {
+                  ingestPhoto {
+                      withContext(Dispatchers.IO) {
+                          val bytes = file.takeIf { it.isFile }?.readBytes()
+                          file.delete()
+                          bytes
+                      }
+                  }
+              }
+
+              private fun ingestPhoto(loader: suspend () -> ByteArray?) {
+                  if (_editor.value == null) return
+                  viewModelScope.launch {
+                      val raw = loader() ?: run {
+                          postMessage("That picture could not be read.")
+                          return@launch
+                      }
+                      val compressed = withContext(Dispatchers.Default) {
+                          ImageCompressor.fromBytes(raw)
+                      } ?: run {
+                          postMessage("That file doesn't look like a picture.")
+                          return@launch
+                      }
+                      val name = repository.addAttachment(compressed)
+                      if (name == null) {
+                          postMessage("Could not save the picture.")
+                          return@launch
+                      }
+                      _editor.update { it?.copy(attachments = it.attachments + name) }
+                  }
+              }
+
+              suspend fun thumbnailFor(name: String): ImageBitmap? {
+                  thumbnails[name]?.let { return it }
+                  val bytes = repository.loadAttachment(name) ?: return null
+                  val bitmap = withContext(Dispatchers.Default) { decodeSampled(bytes, 220) }
+                  if (bitmap != null) thumbnails[name] = bitmap
+                  return bitmap
+              }
+
+              suspend fun fullImageFor(name: String): ImageBitmap? {
+                  val bytes = repository.loadAttachment(name) ?: return null
+                  return withContext(Dispatchers.Default) { decodeSampled(bytes, 2048) }
+              }
+
+              // ------------------------------------------------------------- settings
+
+              fun toggleRevealRecordedTimes() {
+                  val next = !_revealRecordedTimes.value
+                  _revealRecordedTimes.value = next
+                  settings.revealRecordedTimes = next
+              }
+
+              fun setReminder(enabled: Boolean, hour: Int, minute: Int) {
+                  settings.reminderEnabled = enabled
+                  settings.reminderHour = hour
+                  settings.reminderMinute = minute
+                  _reminder.value = ReminderSettings(enabled, hour, minute)
+
+                  if (enabled) {
+                      ReminderScheduler.schedule(appContext, hour, minute)
+                      postMessage("Daily reminder set for %02d:%02d.".format(hour, minute))
+                  } else {
+                      ReminderScheduler.cancel(appContext)
+                      postMessage("Daily reminder turned off.")
+                  }
+              }
+
+              fun changePassword(current: String, new: String, onResult: (String?) -> Unit) {
+                  viewModelScope.launch {
+                      val error = when {
+                          new.length < MIN_PASSWORD_LENGTH ->
+                              "New password must be at least $MIN_PASSWORD_LENGTH characters."
+                          withContext(Dispatchers.Default) {
+                              repository.changePassword(current.toCharArray(), new.toCharArray())
+                          } -> null
+                          else -> "Current password is incorrect."
+                      }
+                      onResult(error)
+                  }
+              }
+
+              // --------------------------------------------------------------- backup
+
+              fun exportTo(uri: Uri) {
+                  _transferInProgress.value = true
+                  viewModelScope.launch {
+                      val result = runCatching { repository.exportTo(uri) }
+                      _transferInProgress.value = false
+                      postMessage(
+                          result.fold(
+                              onSuccess = { count ->
+                                  if (count == 0) "Nothing to export yet."
+                                  else "Exported $count ${plural(count)}."
+                              },
+                              onFailure = { "Export failed: ${it.message ?: "unknown error"}" },
+                          )
+                      )
+                  }
+              }
+
+              fun importFrom(uri: Uri, password: String) {
+                  if (password.isBlank()) {
+                      postMessage("Enter the password for that backup.")
+                      return
+                  }
+                  _transferInProgress.value = true
+                  viewModelScope.launch {
+                      val result = runCatching { repository.importFrom(uri, password.toCharArray()) }
+                      _transferInProgress.value = false
+                      postMessage(
+                          result.fold(
+                              onSuccess = { count ->
+                                  if (count == 0) "That backup had no entries in it."
+                                  else "Imported $count ${plural(count)}."
+                              },
+                              onFailure = { it.message ?: "Import failed." },
+                          )
+                      )
+                  }
+              }
+
+              // ------------------------------------------------------------- messages
+
+              fun clearMessage() {
+                  _message.value = null
+              }
+
+              private fun postMessage(text: String) {
+                  _message.value = UiMessage(System.nanoTime(), text)
+              }
+
+              private fun plural(count: Int) = if (count == 1) "entry" else "entries"
+
+              companion object {
+                  const val MIN_PASSWORD_LENGTH = 6
+                  const val AUTO_LOCK_DELAY_MILLIS = 2 * 60 * 1000L
+              }
+          }
+
+          class JournalViewModelFactory(
+              private val app: JournalApplication,
+          ) : ViewModelProvider.Factory {
+
+              @Suppress("UNCHECKED_CAST")
+              override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                  if (modelClass.isAssignableFrom(JournalViewModel::class.java)) {
+                      return JournalViewModel(
+                          repository = app.repository,
+                          auth = app.authManager,
+                          settings = app.settingsStore,
+                          appContext = app.applicationContext,
+                      ) as T
+                  }
+                  throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
+              }
+          }
+          EOF
+
+          cat > "$PKG/MainActivity.kt" <<'EOF'
+          package com.example.journal
+
+          import android.content.Intent
+          import android.os.Bundle
+          import android.view.WindowManager
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.viewModels
+          import androidx.lifecycle.Lifecycle
+          import androidx.lifecycle.LifecycleEventObserver
+          import androidx.lifecycle.ProcessLifecycleOwner
+          import com.example.journal.ui.JournalRoot
+          import com.example.journal.ui.theme.JournalTheme
+
+          class MainActivity : ComponentActivity() {
+
+              private val viewModel: JournalViewModel by viewModels {
+                  JournalViewModelFactory(application as JournalApplication)
+              }
+
+              private val processObserver = LifecycleEventObserver { _, event ->
+                  when (event) {
+                      Lifecycle.Event.ON_START -> viewModel.cancelPendingLock()
+                      Lifecycle.Event.ON_STOP -> viewModel.scheduleLock()
+                      else -> Unit
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (BLOCK_SCREENSHOTS) {
+                      window.setFlags(
+                          WindowManager.LayoutParams.FLAG_SECURE,
+                          WindowManager.LayoutParams.FLAG_SECURE,
+                      )
+                  }
+
+                  enableEdgeToEdge()
+                  ProcessLifecycleOwner.get().lifecycle.addObserver(processObserver)
+
+                  handleIntent(intent)
+
+                  setContent {
+                      JournalTheme {
+                          JournalRoot(viewModel = viewModel)
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIntent(intent)
+              }
+
+              private fun handleIntent(intent: Intent?) {
+                  if (intent?.action == ACTION_NEW_ENTRY) viewModel.requestNewEntry()
+              }
+
+              override fun onDestroy() {
+                  ProcessLifecycleOwner.get().lifecycle.removeObserver(processObserver)
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_NEW_ENTRY = "com.example.journal.NEW_ENTRY"
+
+                  /** Set to false if you want to be able to take screenshots. */
+                  private const val BLOCK_SCREENSHOTS = true
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write reminder scheduling
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/work
+          mkdir -p "$PKG"
+
+          cat > "$PKG/Notifications.kt" <<'EOF'
+          package com.example.journal.work
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.NotificationManagerCompat
+          import com.example.journal.MainActivity
+
+          object Notifications {
+
+              private const val CHANNEL_ID = "journal_daily_reminder"
+              private const val NOTIFICATION_ID = 1001
+
+              fun ensureChannel(context: Context) {
+                  val manager = context.getSystemService(NotificationManager::class.java) ?: return
+                  if (manager.getNotificationChannel(CHANNEL_ID) == null) {
+                      manager.createNotificationChannel(
+                          NotificationChannel(
+                              CHANNEL_ID,
+                              "Journal reminders",
+                              NotificationManager.IMPORTANCE_DEFAULT,
+                          ).apply { description = "A daily nudge to write your journal." }
+                      )
+                  }
+              }
+
+              fun showReminder(context: Context) {
+                  ensureChannel(context)
+
+                  val intent = Intent(context, MainActivity::class.java).apply {
+                      action = MainActivity.ACTION_NEW_ENTRY
+                      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                  }
+                  val pending = PendingIntent.getActivity(
+                      context,
+                      3,
+                      intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                  )
+
+                  val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                      .setSmallIcon(android.R.drawable.ic_menu_edit)
+                      .setContentTitle("Time to write")
+                      .setContentText("A minute now keeps today from fading.")
+                      .setAutoCancel(true)
+                      .setContentIntent(pending)
+                      .build()
+
+                  try {
+                      NotificationManagerCompat.from(context).notify(NOTIFICATION_ID, notification)
+                  } catch (t: SecurityException) {
+                      // Notification permission was refused; quietly do nothing.
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/ReminderWorker.kt" <<'EOF'
+          package com.example.journal.work
+
+          import android.content.Context
+          import androidx.work.Worker
+          import androidx.work.WorkerParameters
+          import com.example.journal.data.SettingsStore
+
+          class ReminderWorker(
+              appContext: Context,
+              params: WorkerParameters,
+          ) : Worker(appContext, params) {
+
+              override fun doWork(): Result {
+                  val settings = SettingsStore(applicationContext)
+                  if (settings.reminderEnabled) {
+                      Notifications.showReminder(applicationContext)
+                  }
+                  return Result.success()
+              }
+          }
+          EOF
+
+          cat > "$PKG/ReminderScheduler.kt" <<'EOF'
+          package com.example.journal.work
+
+          import android.content.Context
+          import androidx.work.ExistingPeriodicWorkPolicy
+          import androidx.work.PeriodicWorkRequestBuilder
+          import androidx.work.WorkManager
+          import java.time.Duration
+          import java.time.LocalDateTime
+          import java.util.concurrent.TimeUnit
+
+          object ReminderScheduler {
+
+              private const val WORK_NAME = "journal-daily-reminder"
+
+              /** Schedules (or reschedules) a once-a-day reminder at [hour]:[minute]. */
+              fun schedule(context: Context, hour: Int, minute: Int) {
+                  val now = LocalDateTime.now()
+                  var next = now.withHour(hour).withMinute(minute).withSecond(0).withNano(0)
+                  if (!next.isAfter(now)) next = next.plusDays(1)
+
+                  val request = PeriodicWorkRequestBuilder<ReminderWorker>(24, TimeUnit.HOURS)
+                      .setInitialDelay(Duration.between(now, next).toMillis(), TimeUnit.MILLISECONDS)
+                      .build()
+
+                  WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                      WORK_NAME,
+                      ExistingPeriodicWorkPolicy.UPDATE,
+                      request,
+                  )
+              }
+
+              fun cancel(context: Context) {
+                  WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write home screen widget
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/widget
+          mkdir -p "$PKG"
+
+          cat > "$PKG/JournalWidget.kt" <<'EOF'
+          package com.example.journal.widget
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.RemoteViews
+          import com.example.journal.MainActivity
+          import com.example.journal.R
+          import com.example.journal.ui.JournalStats
+
+          /**
+           * The widget runs in the launcher's process, which never has the journal
+           * key, so it only ever shows harmless totals (streak, entry count, words)
+           * cached in SharedPreferences. No entry text reaches it.
+           */
+          object JournalWidget {
+
+              private const val PREFS = "journal_widget"
+              private const val KEY_STREAK = "streak"
+              private const val KEY_ENTRIES = "entries"
+              private const val KEY_WORDS = "words"
+
+              fun push(context: Context, stats: JournalStats) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                      .putInt(KEY_STREAK, stats.currentStreak)
+                      .putInt(KEY_ENTRIES, stats.entries)
+                      .putInt(KEY_WORDS, stats.words)
+                      .apply()
+                  refreshAll(context)
+              }
+
+              fun refreshAll(context: Context) {
+                  val manager = AppWidgetManager.getInstance(context) ?: return
+                  val ids = manager.getAppWidgetIds(
+                      ComponentName(context, JournalWidgetProvider::class.java)
+                  )
+                  ids.forEach { manager.updateAppWidget(it, buildViews(context)) }
+              }
+
+              fun buildViews(context: Context): RemoteViews {
+                  val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val streak = prefs.getInt(KEY_STREAK, 0)
+                  val entries = prefs.getInt(KEY_ENTRIES, 0)
+                  val words = prefs.getInt(KEY_WORDS, 0)
+
+                  val views = RemoteViews(context.packageName, R.layout.widget_journal)
+                  views.setTextViewText(
+                      R.id.widget_stats,
+                      if (entries == 0) context.getString(R.string.widget_empty)
+                      else context.getString(R.string.widget_stats, streak, entries, words),
+                  )
+
+                  views.setOnClickPendingIntent(R.id.widget_action, writeNow(context))
+                  views.setOnClickPendingIntent(R.id.widget_stats, openList(context))
+                  views.setOnClickPendingIntent(R.id.widget_title, openList(context))
+                  return views
+              }
+
+              private fun writeNow(context: Context): PendingIntent {
+                  val intent = Intent(context, MainActivity::class.java).apply {
+                      action = MainActivity.ACTION_NEW_ENTRY
+                      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                  }
+                  return PendingIntent.getActivity(
+                      context,
+                      1,
+                      intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                  )
+              }
+
+              private fun openList(context: Context): PendingIntent {
+                  val intent = Intent(context, MainActivity::class.java).apply {
+                      flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                  }
+                  return PendingIntent.getActivity(
+                      context,
+                      2,
+                      intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                  )
+              }
+          }
+          EOF
+
+          cat > "$PKG/JournalWidgetProvider.kt" <<'EOF'
+          package com.example.journal.widget
+
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.Context
+
+          class JournalWidgetProvider : AppWidgetProvider() {
+
+              override fun onUpdate(
+                  context: Context,
+                  appWidgetManager: AppWidgetManager,
+                  appWidgetIds: IntArray,
+              ) {
+                  JournalWidget.refreshAll(context)
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write shared UI helpers
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+          mkdir -p "$PKG/theme"
+
+          cat > "$PKG/theme/Theme.kt" <<'EOF'
+          package com.example.journal.ui.theme
+
+          import android.os.Build
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.material3.dynamicDarkColorScheme
+          import androidx.compose.material3.dynamicLightColorScheme
+          import androidx.compose.material3.lightColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.platform.LocalContext
+
+          private val LightColors = lightColorScheme()
+          private val DarkColors = darkColorScheme()
+
+          @Composable
+          fun JournalTheme(
+              darkTheme: Boolean = isSystemInDarkTheme(),
+              dynamicColor: Boolean = true,
+              content: @Composable () -> Unit,
+          ) {
+              val colorScheme = when {
+                  dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+                      val context = LocalContext.current
+                      if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+                  }
+                  darkTheme -> DarkColors
+                  else -> LightColors
+              }
+
+              MaterialTheme(colorScheme = colorScheme, content = content)
+          }
+          EOF
+
+          cat > "$PKG/DateUtils.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.ZoneId
+          import java.time.ZoneOffset
+          import java.time.format.DateTimeFormatter
+
+          private val longDate = DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy")
+          private val shortDate = DateTimeFormatter.ofPattern("d MMM yyyy")
+          private val stamp = DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm")
+
+          /** Material3's DatePicker speaks in UTC midnight millis. */
+          fun LocalDate.toUtcMillis(): Long = atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+
+          fun Long.utcToLocalDate(): LocalDate =
+              Instant.ofEpochMilli(this).atZone(ZoneOffset.UTC).toLocalDate()
+
+          fun LocalDate.prettyLabel(): String {
+              val today = LocalDate.now()
+              val base = format(longDate)
+              return when (this) {
+                  today -> "Today · $base"
+                  today.minusDays(1) -> "Yesterday · $base"
+                  else -> base
+              }
+          }
+
+          fun LocalDate.shortLabel(): String = format(shortDate)
+
+          fun Long.stampLabel(): String =
+              Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).format(stamp)
+          EOF
+
+          cat > "$PKG/Components.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.text.KeyboardActions
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+
+          @Composable
+          fun PasswordField(
+              value: String,
+              onValueChange: (String) -> Unit,
+              label: String,
+              imeAction: ImeAction = ImeAction.Next,
+              onDone: () -> Unit = {},
+          ) {
+              OutlinedTextField(
+                  value = value,
+                  onValueChange = onValueChange,
+                  label = { Text(label) },
+                  singleLine = true,
+                  visualTransformation = PasswordVisualTransformation(),
+                  keyboardOptions = KeyboardOptions(
+                      keyboardType = KeyboardType.Password,
+                      imeAction = imeAction,
+                  ),
+                  keyboardActions = KeyboardActions(onDone = { onDone() }),
+                  modifier = Modifier.fillMaxWidth(),
+              )
+          }
+          EOF
+
+          cat > "$PKG/Bitmaps.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.graphics.BitmapFactory
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.graphics.asImageBitmap
+
+          /**
+           * Decodes a picture at a reduced size straight from decrypted bytes, so no
+           * unencrypted copy ever lands on disk.
+           */
+          fun decodeSampled(bytes: ByteArray, maxDimension: Int): ImageBitmap? {
+              val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+              BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+              if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+              var sample = 1
+              while (bounds.outWidth / (sample * 2) >= maxDimension &&
+                  bounds.outHeight / (sample * 2) >= maxDimension
+              ) {
+                  sample *= 2
+              }
+
+              val options = BitmapFactory.Options().apply { inSampleSize = sample }
+              val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+              return bitmap.asImageBitmap()
+          }
+          EOF
+
+          cat > "$PKG/Markdown.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.buildAnnotatedString
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.withStyle
+          import androidx.compose.ui.text.style.TextDecoration
+          import androidx.compose.ui.unit.sp
+
+          /**
+           * A deliberately small Markdown subset, styled but not coloured so it can be
+           * used from anywhere. Search matches are highlighted while rendering, which
+           * is why the highlight style is a parameter rather than a constant.
+           *
+           *   **bold**   *italic*   `code`   ~~strike~~
+           *   # / ## / ### headings      - or * bullets      > quotes
+           *
+           * Underscores are intentionally NOT italic markers, so snake_case stays legible.
+           */
+          object MarkdownLite {
+
+              private val inlineRegex = Regex("""\*\*(.+?)\*\*|\*(.+?)\*|`([^`]+)`|~~(.+?)~~""")
+
+              private class Highlighter(val needle: String, val style: SpanStyle)
+
+              fun render(
+                  source: String,
+                  highlight: String? = null,
+                  highlightStyle: SpanStyle? = null,
+              ): AnnotatedString = buildAnnotatedString {
+                  val highlighter = if (highlight.isNullOrBlank() || highlightStyle == null) null
+                  else Highlighter(highlight, highlightStyle)
+
+                  source.split("\n").forEachIndexed { index, line ->
+                      if (index > 0) append('\n')
+                      val trimmed = line.trimStart()
+                      when {
+                          trimmed.startsWith("### ") ->
+                              withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, fontSize = 15.sp)) {
+                                  appendInline(trimmed.removePrefix("### "), highlighter)
+                              }
+
+                          trimmed.startsWith("## ") ->
+                              withStyle(SpanStyle(fontWeight = FontWeight.SemiBold, fontSize = 17.sp)) {
+                                  appendInline(trimmed.removePrefix("## "), highlighter)
+                              }
+
+                          trimmed.startsWith("# ") ->
+                              withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontSize = 19.sp)) {
+                                  appendInline(trimmed.removePrefix("# "), highlighter)
+                              }
+
+                          trimmed.startsWith("> ") ->
+                              withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+                                  append("| ")
+                                  appendInline(trimmed.removePrefix("> "), highlighter)
+                              }
+
+                          trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                              append("• ")
+                              appendInline(trimmed.drop(2), highlighter)
+                          }
+
+                          else -> appendInline(line, highlighter)
+                      }
+                  }
+              }
+
+              private fun AnnotatedString.Builder.appendInline(line: String, highlighter: Highlighter?) {
+                  var cursor = 0
+                  for (match in inlineRegex.findAll(line)) {
+                      if (match.range.first > cursor) {
+                          appendRaw(line.substring(cursor, match.range.first), highlighter)
+                      }
+                      val groups = match.groupValues
+                      when {
+                          groups[1].isNotEmpty() ->
+                              withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                                  appendRaw(groups[1], highlighter)
+                              }
+
+                          groups[2].isNotEmpty() ->
+                              withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+                                  appendRaw(groups[2], highlighter)
+                              }
+
+                          groups[3].isNotEmpty() ->
+                              withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) {
+                                  appendRaw(groups[3], highlighter)
+                              }
+
+                          groups[4].isNotEmpty() ->
+                              withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) {
+                                  appendRaw(groups[4], highlighter)
+                              }
+                      }
+                      cursor = match.range.last + 1
+                  }
+                  if (cursor < line.length) appendRaw(line.substring(cursor), highlighter)
+              }
+
+              private fun AnnotatedString.Builder.appendRaw(text: String, highlighter: Highlighter?) {
+                  if (highlighter == null || text.isEmpty()) {
+                      append(text)
+                      return
+                  }
+                  var from = 0
+                  while (from < text.length) {
+                      val at = text.indexOf(highlighter.needle, from, ignoreCase = true)
+                      if (at < 0) {
+                          append(text.substring(from))
+                          return
+                      }
+                      if (at > from) append(text.substring(from, at))
+                      val end = (at + highlighter.needle.length).coerceAtMost(text.length)
+                      withStyle(highlighter.style) { append(text.substring(at, end)) }
+                      from = end
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/Mood.kt" <<'EOF'
+          package com.example.journal.ui
+
+          /** Fixed palette so the picker stays a single row and tags stay tidy. */
+          val MOODS = listOf("😄", "🙂", "😐", "😔", "😣", "😠", "😴", "🤩", "🥲", "🤔")
+          EOF
+
+          cat > "$PKG/Stats.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import com.example.journal.data.JournalEntry
+          import java.time.LocalDate
+
+          data class JournalStats(
+              val entries: Int = 0,
+              val daysWritten: Int = 0,
+              val words: Int = 0,
+              val currentStreak: Int = 0,
+              val longestStreak: Int = 0,
+          )
+
+          private val whitespace = Regex("\\s+")
+
+          fun countWords(text: String): Int =
+              text.split(whitespace).count { word -> word.any(Char::isLetterOrDigit) }
+
+          fun computeStats(entries: List<JournalEntry>, today: LocalDate = LocalDate.now()): JournalStats {
+              if (entries.isEmpty()) return JournalStats()
+
+              val dates = entries.map { it.date }.distinct()
+              val descending = dates.sortedDescending()
+              val ascending = dates.sorted()
+
+              // A streak may start today or yesterday, so writing at 1am doesn't break it.
+              var current = 0
+              val latest = descending.first()
+              if (latest == today || latest == today.minusDays(1)) {
+                  var expected = latest
+                  for (date in descending) {
+                      if (date == expected) {
+                          current++
+                          expected = expected.minusDays(1)
+                      } else if (date.isBefore(expected)) {
+                          break
+                      }
+                  }
+              }
+
+              var longest = 0
+              var run = 0
+              var previousDate: LocalDate? = null
+              for (date in ascending) {
+                  val previous = previousDate
+                  run = if (previous != null && previous.plusDays(1) == date) run + 1 else 1
+                  if (run > longest) longest = run
+                  previousDate = date
+              }
+
+              return JournalStats(
+                  entries = entries.size,
+                  daysWritten = dates.size,
+                  words = entries.sumOf { countWords(it.text) },
+                  currentStreak = current,
+                  longestStreak = maxOf(longest, current),
+              )
+          }
+          EOF
+
+          cat > "$PKG/OnThisDay.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import com.example.journal.data.JournalEntry
+          import java.time.LocalDate
+
+          data class OnThisDayHit(val label: String, val entry: JournalEntry)
+
+          /** Looks back at the same day a day, week, month or year ago. */
+          fun computeOnThisDay(entries: List<JournalEntry>, today: LocalDate): List<OnThisDayHit> {
+              if (entries.isEmpty()) return emptyList()
+
+              val byDate = entries.groupBy { it.date }
+              val lookBacks = listOf(
+                  today.minusDays(1) to "Yesterday",
+                  today.minusWeeks(1) to "A week ago",
+                  today.minusMonths(1) to "A month ago",
+                  today.minusMonths(3) to "Three months ago",
+                  today.minusMonths(6) to "Six months ago",
+                  today.minusYears(1) to "A year ago",
+              )
+
+              return buildList {
+                  lookBacks.forEach { (date, label) ->
+                      byDate[date]?.forEach { add(OnThisDayHit(label, it)) }
+                  }
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write lock screens and dialogs
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/LockScreens.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.imePadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.unit.dp
+
+          @Composable
+          fun SetupPasswordScreen(
+              error: String?,
+              busy: Boolean,
+              onSetup: (String, String) -> Unit,
+          ) {
+              var password by rememberSaveable { mutableStateOf("") }
+              var confirm by rememberSaveable { mutableStateOf("") }
+
+              Scaffold { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .verticalScroll(rememberScrollState())
+                          .padding(28.dp)
+                          .imePadding(),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally,
+                  ) {
+                      Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(44.dp))
+                      Spacer(Modifier.height(16.dp))
+                      Text("Create your password", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(Modifier.height(8.dp))
+                      Text(
+                          "Your entries are encrypted with this password. It is never stored anywhere, " +
+                                  "so if you forget it the journal cannot be recovered.",
+                          style = MaterialTheme.typography.bodyMedium,
+                          textAlign = TextAlign.Center,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                      Spacer(Modifier.height(24.dp))
+
+                      PasswordField(password, { password = it }, "Password")
+                      Spacer(Modifier.height(12.dp))
+                      PasswordField(
+                          confirm,
+                          { confirm = it },
+                          "Confirm password",
+                          imeAction = ImeAction.Done,
+                          onDone = { if (!busy) onSetup(password, confirm) },
+                      )
+
+                      if (error != null) {
+                          Spacer(Modifier.height(12.dp))
+                          Text(
+                              error,
+                              color = MaterialTheme.colorScheme.error,
+                              style = MaterialTheme.typography.bodyMedium,
+                          )
+                      }
+
+                      Spacer(Modifier.height(24.dp))
+                      if (busy) {
+                          CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                      } else {
+                          Button(
+                              onClick = { onSetup(password, confirm) },
+                              modifier = Modifier.fillMaxWidth(),
+                          ) {
+                              Text("Create journal")
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun UnlockScreen(
+              error: String?,
+              busy: Boolean,
+              onUnlock: (String) -> Unit,
+          ) {
+              var password by rememberSaveable { mutableStateOf("") }
+
+              Scaffold { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .padding(28.dp)
+                          .imePadding(),
+                      verticalArrangement = Arrangement.Center,
+                      horizontalAlignment = Alignment.CenterHorizontally,
+                  ) {
+                      Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(44.dp))
+                      Spacer(Modifier.height(16.dp))
+                      Text("Journal locked", style = MaterialTheme.typography.headlineSmall)
+                      Spacer(Modifier.height(24.dp))
+
+                      PasswordField(
+                          password,
+                          { password = it },
+                          "Password",
+                          imeAction = ImeAction.Done,
+                          onDone = { if (!busy) onUnlock(password) },
+                      )
+
+                      if (error != null) {
+                          Spacer(Modifier.height(12.dp))
+                          Text(
+                              error,
+                              color = MaterialTheme.colorScheme.error,
+                              style = MaterialTheme.typography.bodyMedium,
+                          )
+                      }
+
+                      Spacer(Modifier.height(24.dp))
+                      if (busy) {
+                          CircularProgressIndicator(modifier = Modifier.size(28.dp))
+                      } else {
+                          Button(
+                              onClick = { onUnlock(password) },
+                              enabled = password.isNotEmpty(),
+                              modifier = Modifier.fillMaxWidth(),
+                          ) {
+                              Text("Unlock")
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/Dialogs.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.ImeAction
+          import androidx.compose.ui.unit.dp
+
+          @Composable
+          fun ChangePasswordDialog(
+              onDismiss: () -> Unit,
+              onSubmit: (String, String, (String?) -> Unit) -> Unit,
+          ) {
+              var current by rememberSaveable { mutableStateOf("") }
+              var newPassword by rememberSaveable { mutableStateOf("") }
+              var confirm by rememberSaveable { mutableStateOf("") }
+              var error by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              AlertDialog(
+                  onDismissRequest = { if (!busy) onDismiss() },
+                  title = { Text("Change password") },
+                  text = {
+                      Column {
+                          Text(
+                              "Every entry and picture is decrypted and re-encrypted with the new " +
+                                      "password. Keep the app open until this finishes.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                          Spacer(Modifier.height(16.dp))
+
+                          PasswordField(current, { current = it }, "Current password")
+                          Spacer(Modifier.height(12.dp))
+                          PasswordField(newPassword, { newPassword = it }, "New password")
+                          Spacer(Modifier.height(12.dp))
+                          PasswordField(
+                              confirm,
+                              { confirm = it },
+                              "Confirm new password",
+                              imeAction = ImeAction.Done,
+                          )
+
+                          if (error != null) {
+                              Spacer(Modifier.height(12.dp))
+                              Text(
+                                  error!!,
+                                  color = MaterialTheme.colorScheme.error,
+                                  style = MaterialTheme.typography.bodySmall,
+                              )
+                          }
+
+                          if (busy) {
+                              Spacer(Modifier.height(12.dp))
+                              LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(
+                          enabled = !busy && current.isNotBlank() && newPassword.isNotBlank(),
+                          onClick = {
+                              if (newPassword != confirm) {
+                                  error = "New passwords don't match."
+                                  return@TextButton
+                              }
+                              busy = true
+                              error = null
+                              onSubmit(current, newPassword) { result ->
+                                  busy = false
+                                  if (result == null) onDismiss() else error = result
+                              }
+                          },
+                      ) { Text("Change") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+                  },
+              )
+          }
+
+          @Composable
+          fun ImportPasswordDialog(
+              onDismiss: () -> Unit,
+              onConfirm: (String) -> Unit,
+          ) {
+              var password by rememberSaveable { mutableStateOf("") }
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text("Open this backup") },
+                  text = {
+                      Column {
+                          Text(
+                              "Backups are encrypted. Enter the journal password that was in " +
+                                      "use when this backup was made.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                          Spacer(Modifier.height(16.dp))
+                          PasswordField(
+                              value = password,
+                              onValueChange = { password = it },
+                              label = "Password for this backup",
+                              imeAction = ImeAction.Done,
+                              onDone = { if (password.isNotBlank()) onConfirm(password) },
+                          )
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(
+                          enabled = password.isNotBlank(),
+                          onClick = { onConfirm(password) },
+                      ) { Text("Import") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel") }
+                  },
+              )
+          }
+
+          @Composable
+          fun UnlockEntryDialog(
+              onDismiss: () -> Unit,
+              onConfirm: (String, (Boolean) -> Unit) -> Unit,
+          ) {
+              var password by rememberSaveable { mutableStateOf("") }
+              var error by remember { mutableStateOf<String?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              AlertDialog(
+                  onDismissRequest = { if (!busy) onDismiss() },
+                  title = { Text("This entry is hidden") },
+                  text = {
+                      Column {
+                          Text(
+                              "Enter your journal password to read it. It is hidden from the list, " +
+                                      "from search snippets and from the On this day cards.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                          Spacer(Modifier.height(16.dp))
+                          PasswordField(
+                              value = password,
+                              onValueChange = { password = it; error = null },
+                              label = "Password",
+                              imeAction = ImeAction.Done,
+                          )
+                          if (error != null) {
+                              Spacer(Modifier.height(12.dp))
+                              Text(
+                                  error!!,
+                                  color = MaterialTheme.colorScheme.error,
+                                  style = MaterialTheme.typography.bodySmall,
+                              )
+                          }
+                          if (busy) {
+                              Spacer(Modifier.height(12.dp))
+                              LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                          }
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(
+                          enabled = !busy && password.isNotBlank(),
+                          onClick = {
+                              busy = true
+                              onConfirm(password) { ok ->
+                                  busy = false
+                                  if (ok) onDismiss() else error = "Wrong password."
+                              }
+                          },
+                      ) { Text("Open") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss, enabled = !busy) { Text("Cancel") }
+                  },
+              )
+          }
+          EOF
+
+          cat > "$PKG/ReminderDialog.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TimePicker
+          import androidx.compose.material3.rememberTimePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import com.example.journal.ReminderSettings
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun ReminderDialog(
+              initial: ReminderSettings,
+              onDismiss: () -> Unit,
+              onSave: (enabled: Boolean, hour: Int, minute: Int) -> Unit,
+          ) {
+              var enabled by rememberSaveable { mutableStateOf(initial.enabled) }
+              val timeState = rememberTimePickerState(
+                  initialHour = initial.hour,
+                  initialMinute = initial.minute,
+                  is24Hour = true,
+              )
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text("Daily reminder") },
+                  text = {
+                      Column {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Switch(checked = enabled, onCheckedChange = { enabled = it })
+                              Spacer(Modifier.width(12.dp))
+                              Text(
+                                  if (enabled) "Remind me every day at" else "Reminders are off",
+                                  style = MaterialTheme.typography.bodyMedium,
+                              )
+                          }
+                          Spacer(Modifier.height(12.dp))
+                          Box(modifier = Modifier.fillMaxWidth()) {
+                              TimePicker(state = timeState)
+                          }
+                          Text(
+                              "Android delivers periodic work in a flexible window, so the " +
+                                      "notification can arrive a few minutes late.",
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { onSave(enabled, timeState.hour, timeState.minute) }) {
+                          Text("Save")
+                      }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel") }
+                  },
+              )
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write the main screens
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/PhotoStrip.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.size
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.AssistChip
+          import androidx.compose.material3.CircularProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.produceState
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.layout.ContentScale
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.compose.ui.window.Dialog
+
+          @Composable
+          fun PhotoStrip(
+              names: List<String>,
+              thumbnailFor: suspend (String) -> ImageBitmap?,
+              fullImageFor: suspend (String) -> ImageBitmap?,
+              onRemove: (String) -> Unit,
+              onAddFromGallery: () -> Unit,
+              onTakePhoto: () -> Unit,
+          ) {
+              var viewing by remember { mutableStateOf<String?>(null) }
+
+              LazyRow(
+                  contentPadding = PaddingValues(horizontal = 12.dp),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  item {
+                      AssistChip(onClick = onTakePhoto, label = { Text("Camera") })
+                  }
+                  item {
+                      AssistChip(onClick = onAddFromGallery, label = { Text("Gallery") })
+                  }
+                  items(names.size) { index ->
+                      val name = names[index]
+                      Box {
+                          AttachmentThumbnail(
+                              name = name,
+                              thumbnailFor = thumbnailFor,
+                              onClick = { viewing = name },
+                          )
+                          Surface(
+                              shape = CircleShape,
+                              color = MaterialTheme.colorScheme.surfaceVariant,
+                              modifier = Modifier
+                                  .align(Alignment.TopEnd)
+                                  .size(20.dp)
+                                  .clickable { onRemove(name) },
+                          ) {
+                              Box(contentAlignment = Alignment.Center) {
+                                  Text("x", fontSize = 11.sp)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              viewing?.let { name ->
+                  PhotoViewer(name = name, fullImageFor = fullImageFor, onDismiss = { viewing = null })
+              }
+          }
+
+          @Composable
+          private fun AttachmentThumbnail(
+              name: String,
+              thumbnailFor: suspend (String) -> ImageBitmap?,
+              onClick: () -> Unit,
+          ) {
+              val bitmap by produceState<ImageBitmap?>(initialValue = null, name) {
+                  value = thumbnailFor(name)
+              }
+
+              Box(
+                  modifier = Modifier
+                      .size(76.dp)
+                      .clip(RoundedCornerShape(12.dp))
+                      .background(MaterialTheme.colorScheme.surfaceVariant)
+                      .clickable(onClick = onClick),
+                  contentAlignment = Alignment.Center,
+              ) {
+                  val picture = bitmap
+                  if (picture == null) {
+                      CircularProgressIndicator(modifier = Modifier.size(20.dp))
+                  } else {
+                      Image(
+                          bitmap = picture,
+                          contentDescription = null,
+                          contentScale = ContentScale.Crop,
+                          modifier = Modifier.fillMaxSize(),
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun PhotoViewer(
+              name: String,
+              fullImageFor: suspend (String) -> ImageBitmap?,
+              onDismiss: () -> Unit,
+          ) {
+              val bitmap by produceState<ImageBitmap?>(initialValue = null, name) {
+                  value = fullImageFor(name)
+              }
+
+              Dialog(onDismissRequest = onDismiss) {
+                  Surface(
+                      shape = RoundedCornerShape(16.dp),
+                      modifier = Modifier.fillMaxWidth(),
+                  ) {
+                      Column(
+                          modifier = Modifier.padding(12.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally,
+                      ) {
+                          val picture = bitmap
+                          if (picture == null) {
+                              CircularProgressIndicator(modifier = Modifier.padding(32.dp))
+                          } else {
+                              Image(
+                                  bitmap = picture,
+                                  contentDescription = null,
+                                  contentScale = ContentScale.Fit,
+                                  modifier = Modifier.fillMaxWidth(),
+                              )
+                          }
+                          Text(
+                              "Tap outside to close",
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              modifier = Modifier.padding(top = 8.dp),
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/EditorScreen.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.imePadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.weight
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.text.selection.SelectionContainer
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.DateRange
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.LockOpen
+          import androidx.compose.material.icons.outlined.DeleteOutline
+          import androidx.compose.material.icons.outlined.Edit
+          import androidx.compose.material.icons.outlined.Visibility
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.DatePicker
+          import androidx.compose.material3.DatePickerDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TextField
+          import androidx.compose.material3.TextFieldDefaults
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.rememberDatePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.FileProvider
+          import com.example.journal.EditorState
+          import java.io.File
+          import java.time.LocalDate
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun EditorScreen(
+              state: EditorState,
+              onTextChange: (String) -> Unit,
+              onDateChange: (LocalDate) -> Unit,
+              onMoodChange: (String?) -> Unit,
+              onToggleLock: () -> Unit,
+              onAddPhotoFromUri: (android.net.Uri) -> Unit,
+              onAddPhotoFromFile: (File) -> Unit,
+              onRemovePhoto: (String) -> Unit,
+              thumbnailFor: suspend (String) -> ImageBitmap?,
+              fullImageFor: suspend (String) -> ImageBitmap?,
+              onSave: () -> Unit,
+              onDelete: (Long) -> Unit,
+              onClose: () -> Unit,
+          ) {
+              val context = LocalContext.current
+
+              var datePickerOpen by remember { mutableStateOf(false) }
+              var discardDialogOpen by remember { mutableStateOf(false) }
+              var deleteDialogOpen by remember { mutableStateOf(false) }
+              var preview by rememberSaveable { mutableStateOf(false) }
+              var captureFile by remember { mutableStateOf<File?>(null) }
+
+              val focusRequester = remember { FocusRequester() }
+
+              LaunchedEffect(state.entryId) {
+                  if (state.isNew) runCatching { focusRequester.requestFocus() }
+              }
+
+              val galleryLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.GetContent()
+              ) { uri -> if (uri != null) onAddPhotoFromUri(uri) }
+
+              val cameraLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.TakePicture()
+              ) { saved ->
+                  val file = captureFile
+                  captureFile = null
+                  if (file != null) {
+                      if (saved) onAddPhotoFromFile(file) else file.delete()
+                  }
+              }
+
+              fun attemptClose() {
+                  if (state.isDirty) discardDialogOpen = true else onClose()
+              }
+
+              BackHandler { attemptClose() }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          navigationIcon = {
+                              IconButton(onClick = { attemptClose() }) {
+                                  Icon(Icons.Default.Close, contentDescription = "Close")
+                              }
+                          },
+                          title = { Text(if (state.isNew) "New entry" else "Edit entry") },
+                          actions = {
+                              IconButton(onClick = onToggleLock) {
+                                  Icon(
+                                      imageVector = if (state.locked) Icons.Default.Lock
+                                      else Icons.Default.LockOpen,
+                                      contentDescription = if (state.locked)
+                                          "Hidden from the list" else "Visible in the list",
+                                  )
+                              }
+                              IconButton(onClick = { preview = !preview }) {
+                                  Icon(
+                                      imageVector = if (preview) Icons.Outlined.Edit
+                                      else Icons.Outlined.Visibility,
+                                      contentDescription = if (preview)
+                                          "Edit text" else "Preview formatting",
+                                  )
+                              }
+                              if (!state.isNew) {
+                                  IconButton(onClick = { deleteDialogOpen = true }) {
+                                      Icon(
+                                          Icons.Outlined.DeleteOutline,
+                                          contentDescription = "Delete entry",
+                                      )
+                                  }
+                              }
+                              TextButton(
+                                  onClick = onSave,
+                                  enabled = state.text.isNotBlank(),
+                              ) { Text("Save") }
+                          },
+                      )
+                  },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .imePadding(),
+                  ) {
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .clickable { datePickerOpen = true }
+                              .padding(horizontal = 16.dp, vertical = 12.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Icon(
+                              Icons.Default.DateRange,
+                              contentDescription = null,
+                              tint = MaterialTheme.colorScheme.primary,
+                          )
+                          Text(
+                              text = "  " + state.date.prettyLabel(),
+                              style = MaterialTheme.typography.bodyMedium,
+                              color = MaterialTheme.colorScheme.primary,
+                          )
+                      }
+
+                      HorizontalDivider()
+
+                      Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                          LazyRow(
+                              contentPadding = PaddingValues(horizontal = 12.dp),
+                              horizontalArrangement = Arrangement.spacedBy(8.dp),
+                          ) {
+                              item {
+                                  FilterChip(
+                                      selected = state.mood == null,
+                                      onClick = { onMoodChange(null) },
+                                      label = { Text("No mood") },
+                                  )
+                              }
+                              items(MOODS.size) { index ->
+                                  val mood = MOODS[index]
+                                  FilterChip(
+                                      selected = state.mood == mood,
+                                      onClick = {
+                                          onMoodChange(if (state.mood == mood) null else mood)
+                                      },
+                                      label = { Text(mood, fontSize = 18.sp) },
+                                  )
+                              }
+                          }
+                      }
+
+                      HorizontalDivider()
+
+                      PhotoStrip(
+                          names = state.attachments,
+                          thumbnailFor = thumbnailFor,
+                          fullImageFor = fullImageFor,
+                          onRemove = onRemovePhoto,
+                          onAddFromGallery = { galleryLauncher.launch("image/*") },
+                          onTakePhoto = {
+                              val directory = File(context.cacheDir, "camera").apply { mkdirs() }
+                              val file = File(directory, "capture-${System.currentTimeMillis()}.jpg")
+                              captureFile = file
+                              val uri = FileProvider.getUriForFile(
+                                  context,
+                                  "${context.packageName}.fileprovider",
+                                  file,
+                              )
+                              cameraLauncher.launch(uri)
+                          },
+                      )
+
+                      HorizontalDivider()
+
+                      if (preview) {
+                          SelectionContainer {
+                              Text(
+                                  text = if (state.text.isBlank()) {
+                                      MarkdownLite.render("Nothing to preview yet.")
+                                  } else {
+                                      MarkdownLite.render(state.text)
+                                  },
+                                  style = MaterialTheme.typography.bodyLarge,
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .weight(1f)
+                                      .verticalScroll(rememberScrollState())
+                                      .padding(16.dp),
+                              )
+                          }
+                      } else {
+                          TextField(
+                              value = state.text,
+                              onValueChange = onTextChange,
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .weight(1f)
+                                  .focusRequester(focusRequester),
+                              placeholder = {
+                                  Text("Write freely. #tag it, add a photo, and markdown works: **bold**.")
+                              },
+                              colors = TextFieldDefaults.colors(
+                                  focusedContainerColor = Color.Transparent,
+                                  unfocusedContainerColor = Color.Transparent,
+                                  focusedIndicatorColor = Color.Transparent,
+                                  unfocusedIndicatorColor = Color.Transparent,
+                              ),
+                          )
+                      }
+
+                      HorizontalDivider()
+
+                      val footer = buildString {
+                          append("${countWords(state.text)} words")
+                          if (state.attachments.isNotEmpty()) {
+                              append("  ·  ${state.attachments.size} photo")
+                              if (state.attachments.size > 1) append("s")
+                          }
+                          if (state.locked) append("  ·  hidden")
+                          val created = state.createdAt
+                          if (created != null) {
+                              append("  ·  recorded ${created.stampLabel()}")
+                              val updated = state.updatedAt
+                              if (updated != null && updated - created > 60_000L) {
+                                  append("  ·  edited ${updated.stampLabel()}")
+                              }
+                          }
+                      }
+                      Text(
+                          text = footer,
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                      )
+                  }
+              }
+
+              if (datePickerOpen) {
+                  val pickerState = rememberDatePickerState(
+                      initialSelectedDateMillis = state.date.toUtcMillis(),
+                  )
+                  DatePickerDialog(
+                      onDismissRequest = { datePickerOpen = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              datePickerOpen = false
+                              pickerState.selectedDateMillis?.utcToLocalDate()?.let(onDateChange)
+                          }) { Text("OK") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { datePickerOpen = false }) { Text("Cancel") }
+                      },
+                  ) {
+                      DatePicker(state = pickerState)
+                  }
+              }
+
+              if (discardDialogOpen) {
+                  AlertDialog(
+                      onDismissRequest = { discardDialogOpen = false },
+                      title = { Text("Discard changes?") },
+                      text = { Text("Your edits to this entry will be lost.") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              discardDialogOpen = false
+                              onClose()
+                          }) { Text("Discard") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { discardDialogOpen = false }) { Text("Keep editing") }
+                      },
+                  )
+              }
+
+              if (deleteDialogOpen) {
+                  AlertDialog(
+                      onDismissRequest = { deleteDialogOpen = false },
+                      title = { Text("Delete this entry?") },
+                      text = { Text("This cannot be undone. Its photos go too.") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              deleteDialogOpen = false
+                              state.entryId?.let(onDelete)
+                          }) { Text("Delete") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { deleteDialogOpen = false }) { Text("Cancel") }
+                      },
+                  )
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Write the entry list screen
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/JournalListScreen.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.foundation.lazy.stickyHeader
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.CalendarMonth
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.Edit
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.MoreVert
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.DatePicker
+          import androidx.compose.material3.DatePickerDialog
+          import androidx.compose.material3.DropdownMenu
+          import androidx.compose.material3.DropdownMenuItem
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.ExtendedFloatingActionButton
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TextField
+          import androidx.compose.material3.TextFieldDefaults
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.rememberDatePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import com.example.journal.ReminderSettings
+          import com.example.journal.UiMessage
+          import com.example.journal.data.JournalEntry
+          import kotlinx.coroutines.launch
+          import java.time.LocalDate
+
+          private sealed interface ListItem {
+              data class DateHeader(val date: LocalDate, val count: Int) : ListItem
+              data class EntryRow(val entry: JournalEntry) : ListItem
+          }
+
+          private fun buildListItems(entries: List<JournalEntry>): List<ListItem> {
+              val items = mutableListOf<ListItem>()
+              var currentDate: LocalDate? = null
+              var bucket = mutableListOf<JournalEntry>()
+
+              fun flush() {
+                  val date = currentDate ?: return
+                  items += ListItem.DateHeader(date, bucket.size)
+                  bucket.forEach { items += ListItem.EntryRow(it) }
+                  bucket = mutableListOf()
+              }
+
+              entries.forEach { entry ->
+                  if (entry.date != currentDate) {
+                      flush()
+                      currentDate = entry.date
+                  }
+                  bucket += entry
+              }
+              flush()
+              return items
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+          @Composable
+          fun JournalListScreen(
+              entries: List<JournalEntry>,
+              stats: JournalStats,
+              onThisDayHits: List<OnThisDayHit>,
+              revealedEntryIds: Set<Long>,
+              revealRecordedTimes: Boolean,
+              reminder: ReminderSettings,
+              transferInProgress: Boolean,
+              message: UiMessage?,
+              onMessageShown: () -> Unit,
+              onToggleRevealRecordedTimes: () -> Unit,
+              onNewEntry: () -> Unit,
+              onNewEntryForDate: (LocalDate) -> Unit,
+              onOpenEntry: (JournalEntry) -> Unit,
+              onRevealEntry: (Long, String, (Boolean) -> Unit) -> Unit,
+              onLock: () -> Unit,
+              onChangePassword: (String, String, (String?) -> Unit) -> Unit,
+              onSaveReminder: (Boolean, Int, Int) -> Unit,
+              onExport: (Uri) -> Unit,
+              onImport: (Uri, String) -> Unit,
+          ) {
+              val context = LocalContext.current
+              val listState = rememberLazyListState()
+              val scope = rememberCoroutineScope()
+              val snackbarHostState = remember { SnackbarHostState() }
+
+              var query by rememberSaveable { mutableStateOf("") }
+              var searchOpen by rememberSaveable { mutableStateOf(false) }
+              var activeTag by rememberSaveable { mutableStateOf<String?>(null) }
+              var menuOpen by remember { mutableStateOf(false) }
+              var pickerOpen by remember { mutableStateOf(false) }
+              var reminderOpen by remember { mutableStateOf(false) }
+              var changePasswordOpen by remember { mutableStateOf(false) }
+              var importUri by remember { mutableStateOf<Uri?>(null) }
+              var notificationsBlockedDialog by remember { mutableStateOf(false) }
+              var dateWithNoEntries by remember { mutableStateOf<LocalDate?>(null) }
+              var pendingLockedEntry by remember { mutableStateOf<JournalEntry?>(null) }
+
+              fun requestOpen(entry: JournalEntry) {
+                  if (entry.locked && entry.id !in revealedEntryIds) {
+                      pendingLockedEntry = entry
+                  } else {
+                      onOpenEntry(entry)
+                  }
+              }
+
+              LaunchedEffect(message?.id) {
+                  val current = message ?: return@LaunchedEffect
+                  snackbarHostState.showSnackbar(current.text)
+                  onMessageShown()
+              }
+
+              val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted -> if (!granted) notificationsBlockedDialog = true }
+
+              val exportLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/json")
+              ) { uri -> uri?.let(onExport) }
+
+              val importLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri -> if (uri != null) importUri = uri }
+
+              val allTags = remember(entries) {
+                  entries.flatMap { it.tags }
+                      .groupingBy { it }
+                      .eachCount()
+                      .entries
+                      .sortedByDescending { it.value }
+                      .map { it.key }
+              }
+
+              val filtered = remember(entries, query, activeTag) {
+                  entries.asSequence()
+                      .filter { activeTag == null || activeTag in it.tags }
+                      .filter {
+                          query.isBlank() ||
+                                  it.text.contains(query, ignoreCase = true) ||
+                                  it.date.toString().contains(query) ||
+                                  it.date.shortLabel().contains(query, ignoreCase = true)
+                      }
+                      .toList()
+              }
+              val listItems = remember(filtered) { buildListItems(filtered) }
+
+              Scaffold(
+                  topBar = {
+                      if (searchOpen) {
+                          TopAppBar(
+                              title = {
+                                  TextField(
+                                      value = query,
+                                      onValueChange = { query = it },
+                                      placeholder = { Text("Search entries") },
+                                      singleLine = true,
+                                      colors = TextFieldDefaults.colors(
+                                          focusedContainerColor = Color.Transparent,
+                                          unfocusedContainerColor = Color.Transparent,
+                                          focusedIndicatorColor = Color.Transparent,
+                                          unfocusedIndicatorColor = Color.Transparent,
+                                      ),
+                                  )
+                              },
+                              navigationIcon = {
+                                  IconButton(onClick = {
+                                      searchOpen = false
+                                      query = ""
+                                  }) { Icon(Icons.Default.Close, contentDescription = "Close search") }
+                              },
+                          )
+                      } else {
+                          TopAppBar(
+                              title = { Text("Journal") },
+                              actions = {
+                                  IconButton(onClick = { searchOpen = true }) {
+                                      Icon(Icons.Default.Search, contentDescription = "Search")
+                                  }
+                                  IconButton(onClick = { pickerOpen = true }) {
+                                      Icon(Icons.Default.CalendarMonth, contentDescription = "Jump to a date")
+                                  }
+                                  Box {
+                                      IconButton(onClick = { menuOpen = true }) {
+                                          Icon(Icons.Default.MoreVert, contentDescription = "More")
+                                      }
+                                      DropdownMenu(
+                                          expanded = menuOpen,
+                                          onDismissRequest = { menuOpen = false },
+                                      ) {
+                                          DropdownMenuItem(
+                                              text = {
+                                                  Text(
+                                                      if (revealRecordedTimes) "Hide recorded times"
+                                                      else "Show recorded times"
+                                                  )
+                                              },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  onToggleRevealRecordedTimes()
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = {
+                                                  Text(
+                                                      if (reminder.enabled)
+                                                          "Daily reminder · %02d:%02d".format(reminder.hour, reminder.minute)
+                                                      else "Daily reminder"
+                                                  )
+                                              },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  reminderOpen = true
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Export journal") },
+                                              enabled = !transferInProgress,
+                                              onClick = {
+                                                  menuOpen = false
+                                                  exportLauncher.launch("journal-backup-${LocalDate.now()}.json")
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Import journal") },
+                                              enabled = !transferInProgress,
+                                              onClick = {
+                                                  menuOpen = false
+                                                  importLauncher.launch(arrayOf("*/*"))
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Change password") },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  changePasswordOpen = true
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Lock now") },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  onLock()
+                                              },
+                                          )
+                                      }
+                                  }
+                              },
+                          )
+                      }
+                  },
+                  snackbarHost = { SnackbarHost(snackbarHostState) },
+                  floatingActionButton = {
+                      ExtendedFloatingActionButton(
+                          onClick = onNewEntry,
+                          icon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                          text = { Text("New entry") },
+                      )
+                  },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding),
+                  ) {
+                      if (allTags.isNotEmpty()) {
+                          TagFilterRow(
+                              tags = allTags,
+                              activeTag = activeTag,
+                              onSelect = { activeTag = it },
+                          )
+                      }
+
+                      if (transferInProgress) {
+                          LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                      }
+
+                      Box(modifier = Modifier.fillMaxSize()) {
+                          when {
+                              entries.isEmpty() -> EmptyState()
+
+                              listItems.isEmpty() -> Box(
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentAlignment = Alignment.Center,
+                              ) {
+                                  Text(
+                                      text = when {
+                                          activeTag != null && query.isNotBlank() ->
+                                              "Nothing tagged #$activeTag matches \"$query\""
+                                          activeTag != null -> "Nothing tagged #$activeTag yet"
+                                          else -> "No entries match \"$query\""
+                                      },
+                                      textAlign = TextAlign.Center,
+                                      modifier = Modifier.padding(24.dp),
+                                  )
+                              }
+
+                              else -> LazyColumn(
+                                  state = listState,
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentPadding = PaddingValues(bottom = 96.dp),
+                              ) {
+                                  if (query.isBlank() && activeTag == null) {
+                                      item(key = "overview") {
+                                          OverviewCard(
+                                              stats = stats,
+                                              hits = onThisDayHits,
+                                              revealedEntryIds = revealedEntryIds,
+                                              onRequestOpen = ::requestOpen,
+                                          )
+                                      }
+                                  }
+
+                                  listItems.forEach { listItem ->
+                                      when (listItem) {
+                                          is ListItem.DateHeader -> stickyHeader(
+                                              key = "header-${listItem.date}"
+                                          ) {
+                                              DateHeaderRow(listItem.date, listItem.count)
+                                          }
+
+                                          is ListItem.EntryRow -> item(
+                                              key = "entry-${listItem.entry.id}"
+                                          ) {
+                                              EntryCard(
+                                                  entry = listItem.entry,
+                                                  hidden = listItem.entry.locked &&
+                                                          listItem.entry.id !in revealedEntryIds,
+                                                  query = query,
+                                                  revealRecordedTimes = revealRecordedTimes,
+                                                  onClick = { requestOpen(listItem.entry) },
+                                              )
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if (pickerOpen) {
+                  val pickerState = rememberDatePickerState(
+                      initialSelectedDateMillis = LocalDate.now().toUtcMillis(),
+                  )
+                  DatePickerDialog(
+                      onDismissRequest = { pickerOpen = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              pickerOpen = false
+                              val picked = pickerState.selectedDateMillis?.utcToLocalDate()
+                                  ?: return@TextButton
+                              val index = listItems.indexOfFirst {
+                                  it is ListItem.DateHeader && it.date == picked
+                              }
+                              if (index >= 0) {
+                                  scope.launch { listState.animateScrollToItem(index) }
+                              } else {
+                                  dateWithNoEntries = picked
+                              }
+                          }) { Text("Go") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { pickerOpen = false }) { Text("Cancel") }
+                      },
+                  ) {
+                      DatePicker(state = pickerState)
+                  }
+              }
+
+              dateWithNoEntries?.let { date ->
+                  AlertDialog(
+                      onDismissRequest = { dateWithNoEntries = null },
+                      title = { Text("Nothing written yet") },
+                      text = {
+                          Text(
+                              "There are no entries for ${date.shortLabel()}. " +
+                                      "Would you like to write one for that day?"
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              dateWithNoEntries = null
+                              onNewEntryForDate(date)
+                          }) { Text("Write it") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { dateWithNoEntries = null }) { Text("Cancel") }
+                      },
+                  )
+              }
+
+              pendingLockedEntry?.let { entry ->
+                  UnlockEntryDialog(
+                      onDismiss = { pendingLockedEntry = null },
+                      onConfirm = { password, done ->
+                          onRevealEntry(entry.id, password) { ok ->
+                              done(ok)
+                              if (ok) {
+                                  pendingLockedEntry = null
+                                  onOpenEntry(entry)
+                              }
+                          }
+                      },
+                  )
+              }
+
+              if (reminderOpen) {
+                  ReminderDialog(
+                      initial = reminder,
+                      onDismiss = { reminderOpen = false },
+                      onSave = { enabled, hour, minute ->
+                          reminderOpen = false
+                          val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                                  ContextCompat.checkSelfPermission(
+                                      context,
+                                      Manifest.permission.POST_NOTIFICATIONS,
+                                  ) != PackageManager.PERMISSION_GRANTED
+                          if (enabled && needsPermission) {
+                              notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                          }
+                          onSaveReminder(enabled, hour, minute)
+                      },
+                  )
+              }
+
+              importUri?.let { uri ->
+                  ImportPasswordDialog(
+                      onDismiss = { importUri = null },
+                      onConfirm = { password ->
+                          importUri = null
+                          onImport(uri, password)
+                      },
+                  )
+              }
+
+              if (notificationsBlockedDialog) {
+                  AlertDialog(
+                      onDismissRequest = { notificationsBlockedDialog = false },
+                      title = { Text("Notifications are off") },
+                      text = {
+                          Text(
+                              "Android is blocking notifications for this app, so the reminder " +
+                                      "won't appear. You can turn them back on in Settings, Apps, " +
+                                      "Journal, Notifications."
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { notificationsBlockedDialog = false }) { Text("OK") }
+                      },
+                  )
+              }
+
+              if (changePasswordOpen) {
+                  ChangePasswordDialog(
+                      onDismiss = { changePasswordOpen = false },
+                      onSubmit = onChangePassword,
+                  )
+              }
+          }
+
+          @Composable
+          private fun TagFilterRow(
+              tags: List<String>,
+              activeTag: String?,
+              onSelect: (String?) -> Unit,
+          ) {
+              LazyRow(
+                  contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+              ) {
+                  item {
+                      FilterChip(
+                          selected = activeTag == null,
+                          onClick = { onSelect(null) },
+                          label = { Text("All") },
+                      )
+                  }
+                  items(tags.size) { index ->
+                      val tag = tags[index]
+                      FilterChip(
+                          selected = activeTag == tag,
+                          onClick = { onSelect(if (activeTag == tag) null else tag) },
+                          label = { Text("#$tag") },
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun OverviewCard(
+              stats: JournalStats,
+              hits: List<OnThisDayHit>,
+              revealedEntryIds: Set<Long>,
+              onRequestOpen: (JournalEntry) -> Unit,
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 12.dp, vertical = 8.dp),
+              ) {
+                  Card {
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(vertical = 16.dp, horizontal = 8.dp),
+                          horizontalArrangement = Arrangement.SpaceEvenly,
+                      ) {
+                          StatBlock(stats.currentStreak.toString(), "day streak")
+                          StatBlock(stats.longestStreak.toString(), "best")
+                          StatBlock(stats.entries.toString(), "entries")
+                          StatBlock(stats.words.toString(), "words")
+                      }
+                  }
+
+                  if (hits.isNotEmpty()) {
+                      Spacer(Modifier.height(14.dp))
+                      Text(
+                          text = "On this day",
+                          style = MaterialTheme.typography.titleSmall,
+                          fontWeight = FontWeight.SemiBold,
+                          color = MaterialTheme.colorScheme.primary,
+                      )
+                      hits.forEach { hit ->
+                          val hidden = hit.entry.locked && hit.entry.id !in revealedEntryIds
+                          Card(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .padding(top = 6.dp)
+                                  .clickable { onRequestOpen(hit.entry) },
+                          ) {
+                              Column(modifier = Modifier.padding(12.dp)) {
+                                  Text(
+                                      text = hit.label,
+                                      style = MaterialTheme.typography.labelSmall,
+                                      color = MaterialTheme.colorScheme.primary,
+                                  )
+                                  Spacer(Modifier.height(2.dp))
+                                  if (hidden) {
+                                      Text(
+                                          text = "Hidden entry — tap to unlock",
+                                          style = MaterialTheme.typography.bodyMedium,
+                                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                      )
+                                  } else {
+                                      Text(
+                                          text = MarkdownLite.render(hit.entry.text),
+                                          style = MaterialTheme.typography.bodyMedium,
+                                          maxLines = 3,
+                                          overflow = TextOverflow.Ellipsis,
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun StatBlock(value: String, label: String) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(
+                      text = value,
+                      style = MaterialTheme.typography.titleMedium,
+                      fontWeight = FontWeight.Bold,
+                  )
+                  Text(
+                      text = label,
+                      style = MaterialTheme.typography.labelSmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+              }
+          }
+
+          @Composable
+          private fun EmptyState() {
+              Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                  Column(
+                      horizontalAlignment = Alignment.CenterHorizontally,
+                      modifier = Modifier.padding(32.dp),
+                  ) {
+                      Text("Nothing here yet", style = MaterialTheme.typography.titleMedium)
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          "Tap New entry to write your first one. It will be stamped with " +
+                                  "today's date and the current time.",
+                          style = MaterialTheme.typography.bodyMedium,
+                          textAlign = TextAlign.Center,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun DateHeaderRow(date: LocalDate, count: Int) {
+              Surface(
+                  color = MaterialTheme.colorScheme.surface,
+                  modifier = Modifier.fillMaxWidth(),
+              ) {
+                  Row(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .padding(horizontal = 16.dp, vertical = 10.dp),
+                      verticalAlignment = Alignment.CenterVertically,
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                  ) {
+                      Text(
+                          text = date.prettyLabel(),
+                          style = MaterialTheme.typography.titleSmall,
+                          fontWeight = FontWeight.SemiBold,
+                          color = MaterialTheme.colorScheme.primary,
+                      )
+                      if (count > 1) {
+                          Text(
+                              text = "$count entries",
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun EntryCard(
+              entry: JournalEntry,
+              hidden: Boolean,
+              query: String,
+              revealRecordedTimes: Boolean,
+              onClick: () -> Unit,
+          ) {
+              Card(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 12.dp, vertical = 4.dp)
+                      .clickable(onClick = onClick),
+              ) {
+                  Column(modifier = Modifier.padding(16.dp)) {
+                      if (hidden) {
+                          Row(verticalAlignment = Alignment.CenterVertically) {
+                              Icon(
+                                  Icons.Default.Lock,
+                                  contentDescription = null,
+                                  tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                  modifier = Modifier.height(16.dp),
+                              )
+                              Spacer(Modifier.height(0.dp))
+                              Text(
+                                  text = "  Hidden entry — tap to unlock",
+                                  style = MaterialTheme.typography.bodyMedium,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                          }
+                      } else {
+                          if (entry.mood != null) {
+                              Text(text = entry.mood, fontSize = 22.sp)
+                              Spacer(Modifier.height(4.dp))
+                          }
+
+                          Text(
+                              text = if (entry.text.isBlank()) {
+                                  androidx.compose.ui.text.AnnotatedString("(empty)")
+                              } else {
+                                  MarkdownLite.render(
+                                      source = entry.text,
+                                      highlight = query,
+                                      highlightStyle = SpanStyle(
+                                          background = MaterialTheme.colorScheme.primaryContainer,
+                                          color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                          fontWeight = FontWeight.Bold,
+                                      ),
+                                  )
+                              },
+                              style = MaterialTheme.typography.bodyLarge,
+                              maxLines = 5,
+                              overflow = TextOverflow.Ellipsis,
+                          )
+
+                          if (entry.tags.isNotEmpty()) {
+                              Spacer(Modifier.height(8.dp))
+                              Text(
+                                  text = entry.tags.joinToString(" ") { "#$it" },
+                                  style = MaterialTheme.typography.labelSmall,
+                                  color = MaterialTheme.colorScheme.primary,
+                              )
+                          }
+                      }
+
+                      if (revealRecordedTimes) {
+                          Spacer(Modifier.height(8.dp))
+                          val edited = entry.updatedAt - entry.createdAt > 60_000L
+                          Text(
+                              text = buildString {
+                                  append("Recorded ${entry.createdAt.stampLabel()}")
+                                  if (edited) append(" · edited ${entry.updatedAt.stampLabel()}")
+                                  if (entry.attachments.isNotEmpty()) {
+                                      append(" · ${entry.attachments.size} photo")
+                                      if (entry.attachments.size > 1) append("s")
+                                  }
+                              },
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/JournalRoot.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.example.journal.JournalViewModel
+          import com.example.journal.LockState
+
+          @Composable
+          fun JournalRoot(viewModel: JournalViewModel) {
+
+              val lockState by viewModel.lockState.collectAsStateWithLifecycle()
+              val entries by viewModel.entries.collectAsStateWithLifecycle()
+              val stats by viewModel.stats.collectAsStateWithLifecycle()
+              val onThisDay by viewModel.onThisDay.collectAsStateWithLifecycle()
+              val editor by viewModel.editor.collectAsStateWithLifecycle()
+              val authError by viewModel.authError.collectAsStateWithLifecycle()
+              val authBusy by viewModel.authBusy.collectAsStateWithLifecycle()
+              val reveal by viewModel.revealRecordedTimes.collectAsStateWithLifecycle()
+              val revealedEntries by viewModel.revealedEntries.collectAsStateWithLifecycle()
+              val reminder by viewModel.reminder.collectAsStateWithLifecycle()
+              val message by viewModel.message.collectAsStateWithLifecycle()
+              val transfer by viewModel.transferInProgress.collectAsStateWithLifecycle()
+
+              when (lockState) {
+                  LockState.NeedsSetup -> SetupPasswordScreen(
+                      error = authError,
+                      busy = authBusy,
+                      onSetup = viewModel::setupPassword,
+                  )
+
+                  LockState.Locked -> UnlockScreen(
+                      error = authError,
+                      busy = authBusy,
+                      onUnlock = viewModel::unlock,
+                  )
+
+                  LockState.Unlocked -> {
+                      val open = editor
+                      if (open != null) {
+                          EditorScreen(
+                              state = open,
+                              onTextChange = { viewModel.updateDraft(text = it) },
+                              onDateChange = { viewModel.updateDraft(date = it) },
+                              onMoodChange = viewModel::setMood,
+                              onToggleLock = viewModel::toggleDraftLock,
+                              onAddPhotoFromUri = viewModel::addPhotoFromUri,
+                              onAddPhotoFromFile = viewModel::addPhotoFromFile,
+                              onRemovePhoto = viewModel::removePhoto,
+                              thumbnailFor = viewModel::thumbnailFor,
+                              fullImageFor = viewModel::fullImageFor,
+                              onSave = viewModel::saveDraft,
+                              onDelete = viewModel::deleteEntry,
+                              onClose = viewModel::closeEditor,
+                          )
+                      } else {
+                          JournalListScreen(
+                              entries = entries,
+                              stats = stats,
+                              onThisDayHits = onThisDay,
+                              revealedEntryIds = revealedEntries,
+                              revealRecordedTimes = reveal,
+                              reminder = reminder,
+                              transferInProgress = transfer,
+                              message = message,
+                              onMessageShown = viewModel::clearMessage,
+                              onToggleRevealRecordedTimes = viewModel::toggleRevealRecordedTimes,
+                              onNewEntry = { viewModel.openNewEntry() },
+                              onNewEntryForDate = { viewModel.openNewEntry(it) },
+                              onOpenEntry = viewModel::openEntry,
+                              onRevealEntry = viewModel::revealEntry,
+                              onLock = viewModel::lock,
+                              onChangePassword = viewModel::changePassword,
+                              onSaveReminder = viewModel::setReminder,
+                              onExport = viewModel::exportTo,
+                              onImport = viewModel::importFrom,
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+      # ------------------------------------------------------------------
+      - name: Mark the scaffold as complete
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          printf 'This file stops the workflow from overwriting your edits.\nDelete it only if you want the source regenerated from scratch.\n' > .journal-scaffolded
+
+      - name: Commit the scaffold into your repository
+        if: steps.scaffold_check.outputs.needed == 'true'
+        run: |
+          git config user.name "journal-scaffold"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "Add journal app source (generated by the build workflow)"
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+      # ------------------------------------------------------------------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the SDK packages this build needs
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Point Gradle at the SDK
+        run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
+
+      - name: Build the debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publish the APK as a release download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view apk-latest > /dev/null 2>&1 || \
+            gh release create apk-latest \
+              --title "Latest build" \
+              --notes "Built automatically from the newest commit. Download app-debug.apk below."
+          gh release upload apk-latest app/build/outputs/apk/debug/app-debug.apk --clobber
