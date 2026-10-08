@@ -1,0 +1,3865 @@
+name: Phase 1
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  phase1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether this phase already ran
+        id: check
+        run: |
+          if [ -f .phase-1-applied ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write data layer
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/data
+          mkdir -p "$PKG"
+
+          cat > "$PKG/MoodScale.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import androidx.core.content.edit
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          data class MoodLevel(val emoji: String, val label: String)
+
+          /**
+           * Five fixed levels from -2 to +2. Only the emoji and the label are yours to
+           * change. Entries store the number, so re-skinning a level instantly restyles
+           * every past entry and keeps trend maths valid.
+           */
+          data class MoodScale(val levels: List<MoodLevel>) {
+
+              fun emojiFor(valence: Int): String? = levels.getOrNull(valence + OFFSET)?.emoji
+
+              fun labelFor(valence: Int): String? = levels.getOrNull(valence + OFFSET)?.label
+
+              fun withEmoji(index: Int, emoji: String): MoodScale = copy(
+                  levels = levels.mapIndexed { i, level ->
+                      if (i == index) level.copy(emoji = emoji) else level
+                  }
+              )
+
+              fun withLabel(index: Int, label: String): MoodScale = copy(
+                  levels = levels.mapIndexed { i, level ->
+                      if (i == index) level.copy(label = label) else level
+                  }
+              )
+
+              companion object {
+                  const val OFFSET = 2
+                  const val MIN = -2
+                  const val MAX = 2
+
+                  val DEFAULT = MoodScale(
+                      listOf(
+                          MoodLevel("\uD83D\uDE23", "Bad"),
+                          MoodLevel("\uD83D\uDE14", "Low"),
+                          MoodLevel("\uD83D\uDE10", "Neutral"),
+                          MoodLevel("\uD83D\uDE42", "Good"),
+                          MoodLevel("\uD83D\uDE04", "Great"),
+                      )
+                  )
+
+                  /** Emoji used before moods carried a number. Mapped once, at read time. */
+                  private val LEGACY = mapOf(
+                      "\uD83D\uDE04" to 2, "\uD83E\uDD29" to 2,
+                      "\uD83D\uDE42" to 1,
+                      "\uD83D\uDE10" to 0, "\uD83D\uDE34" to 0, "\uD83E\uDD14" to 0,
+                      "\uD83D\uDE14" to -1, "\uD83E\uDD72" to -1,
+                      "\uD83D\uDE23" to -2, "\uD83D\uDE20" to -2,
+                  )
+
+                  fun legacyValence(emoji: String): Int? = LEGACY[emoji]
+              }
+          }
+
+          class MoodScaleStore(context: Context) {
+
+              private val prefs = context.applicationContext
+                  .getSharedPreferences("journal_mood_scale", Context.MODE_PRIVATE)
+
+              fun load(): MoodScale {
+                  val raw = prefs.getString(KEY, null) ?: return MoodScale.DEFAULT
+                  return runCatching {
+                      val array = JSONArray(raw)
+                      val levels = (0 until array.length()).mapNotNull { i ->
+                          val item = array.optJSONObject(i) ?: return@mapNotNull null
+                          val emoji = item.optString("e")
+                          if (emoji.isBlank()) return@mapNotNull null
+                          MoodLevel(emoji, item.optString("l"))
+                      }
+                      if (levels.size == 5) MoodScale(levels) else MoodScale.DEFAULT
+                  }.getOrDefault(MoodScale.DEFAULT)
+              }
+
+              fun save(scale: MoodScale) {
+                  val array = JSONArray()
+                  scale.levels.forEach { level ->
+                      val item = JSONObject()
+                      item.put("e", level.emoji)
+                      item.put("l", level.label)
+                      array.put(item)
+                  }
+                  prefs.edit { putString(KEY, array.toString()) }
+              }
+
+              fun reset() {
+                  prefs.edit { remove(KEY) }
+              }
+
+              private companion object {
+                  const val KEY = "scale"
+              }
+          }
+          EOF
+
+          cat > "$PKG/Notebooks.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import androidx.core.content.edit
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import javax.crypto.SecretKey
+
+          data class Notebook(
+              val id: Long,
+              val name: String,
+              val pinned: Boolean,
+              val order: Int,
+          )
+
+          data class NotebookSet(val notebooks: List<Notebook>) {
+
+              /** Pinned first, then by order, then by name: the order the chips appear in. */
+              val displayOrder: List<Notebook>
+                  get() = notebooks.sortedWith(
+                      compareByDescending<Notebook> { it.pinned }
+                          .thenBy { it.order }
+                          .thenBy { it.name.lowercase() }
+                  )
+
+              fun byId(id: Long): Notebook? = notebooks.firstOrNull { it.id == id }
+
+              fun nameOf(id: Long): String? = byId(id)?.name
+
+              val firstId: Long? get() = displayOrder.firstOrNull()?.id
+
+              companion object {
+                  const val DEFAULT_ID = 1L
+                  val DEFAULT = NotebookSet(
+                      listOf(Notebook(DEFAULT_ID, "Journal", pinned = true, order = 0))
+                  )
+              }
+          }
+
+          /**
+           * Notebook names are personal, so the whole set lives as one encrypted blob
+           * rather than a plaintext table. There are only ever a handful, so decrypting
+           * them all at unlock costs nothing.
+           */
+          class NotebookStore(context: Context) {
+
+              private val prefs = context.applicationContext
+                  .getSharedPreferences("journal_notebooks", Context.MODE_PRIVATE)
+
+              fun load(key: SecretKey): NotebookSet {
+                  val cipherText = prefs.getString(KEY_BLOB, null) ?: return NotebookSet.DEFAULT
+                  val iv = prefs.getString(KEY_IV, null) ?: return NotebookSet.DEFAULT
+                  val json = runCatching { CryptoManager.decrypt(key, cipherText, iv) }.getOrNull()
+                      ?: return NotebookSet.DEFAULT
+                  return decode(json)
+              }
+
+              fun save(key: SecretKey, set: NotebookSet) {
+                  val encrypted = CryptoManager.encrypt(key, encode(set))
+                  prefs.edit {
+                      putString(KEY_BLOB, encrypted.cipherText)
+                      putString(KEY_IV, encrypted.iv)
+                  }
+              }
+
+              private fun encode(set: NotebookSet): String {
+                  val array = JSONArray()
+                  set.notebooks.forEach { notebook ->
+                      val item = JSONObject()
+                      item.put("id", notebook.id)
+                      item.put("name", notebook.name)
+                      item.put("pinned", notebook.pinned)
+                      item.put("order", notebook.order)
+                      array.put(item)
+                  }
+                  return array.toString()
+              }
+
+              private fun decode(json: String): NotebookSet = runCatching {
+                  val array = JSONArray(json)
+                  val notebooks = (0 until array.length()).mapNotNull { i ->
+                      val item = array.optJSONObject(i) ?: return@mapNotNull null
+                      val name = item.optString("name")
+                      if (name.isBlank()) return@mapNotNull null
+                      Notebook(
+                          id = item.optLong("id", 0L),
+                          name = name,
+                          pinned = item.optBoolean("pinned", false),
+                          order = item.optInt("order", 0),
+                      )
+                  }.filter { it.id > 0L }
+                  if (notebooks.isEmpty()) NotebookSet.DEFAULT else NotebookSet(notebooks)
+              }.getOrDefault(NotebookSet.DEFAULT)
+
+              private companion object {
+                  const val KEY_BLOB = "blob"
+                  const val KEY_IV = "iv"
+              }
+          }
+          EOF
+
+          cat > "$PKG/Payload.kt" <<'EOF'
+          package com.example.journal.data
+
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /**
+           * Everything encrypted for one block: the text, the time it claims, its mood,
+           * its notebook, the hidden flag and its photo names. None of it is plaintext.
+           */
+          data class EntryPayload(
+              val text: String,
+              val eventTime: Long? = null,
+              val valence: Int? = null,
+              val customMood: String? = null,
+              val notebookId: Long? = null,
+              val locked: Boolean = false,
+              val attachments: List<String> = emptyList(),
+          )
+
+          object PayloadCodec {
+
+              fun encode(payload: EntryPayload): String {
+                  val json = JSONObject()
+                  json.put("v", 4)
+                  json.put("text", payload.text)
+                  payload.eventTime?.let { json.put("eventTime", it) }
+                  payload.valence?.let { json.put("valence", it) }
+                  payload.customMood?.let { json.put("customMood", it) }
+                  payload.notebookId?.let { json.put("notebook", it) }
+                  if (payload.locked) json.put("locked", true)
+                  if (payload.attachments.isNotEmpty()) {
+                      json.put("attachments", JSONArray(payload.attachments))
+                  }
+                  return json.toString()
+              }
+
+              /**
+               * Reads every version we have ever written. Blocks from before moods
+               * carried a number still hold an emoji under "mood"; those are translated
+               * to a valence here rather than in a migration pass.
+               */
+              fun decode(raw: String): EntryPayload {
+                  if (!raw.trimStart().startsWith("{")) return EntryPayload(raw)
+                  return try {
+                      val json = JSONObject(raw)
+                      if (!json.has("text")) return EntryPayload(raw)
+
+                      val attachments = json.optJSONArray("attachments")?.let { array ->
+                          (0 until array.length()).mapNotNull { i ->
+                              val name = array.optString(i)
+                              if (name.isBlank()) null else name
+                          }
+                      } ?: emptyList()
+
+                      var valence: Int? = null
+                      var customMood: String? = null
+
+                      if (json.has("valence") && !json.isNull("valence")) {
+                          valence = json.optInt("valence").coerceIn(MoodScale.MIN, MoodScale.MAX)
+                      }
+
+                      val legacy = json.optString("mood")
+                      if (valence == null && legacy.isNotBlank() && !json.isNull("mood")) {
+                          val mapped = MoodScale.legacyValence(legacy)
+                          if (mapped != null) valence = mapped else customMood = legacy
+                      }
+
+                      val explicitCustom = json.optString("customMood")
+                      if (explicitCustom.isNotBlank() && !json.isNull("customMood")) {
+                          customMood = explicitCustom
+                      }
+
+                      var eventTime: Long? = null
+                      if (json.has("eventTime") && !json.isNull("eventTime")) {
+                          val value = json.optLong("eventTime", 0L)
+                          if (value > 0L) eventTime = value
+                      }
+
+                      var notebookId: Long? = null
+                      if (json.has("notebook") && !json.isNull("notebook")) {
+                          val value = json.optLong("notebook", 0L)
+                          if (value > 0L) notebookId = value
+                      }
+
+                      EntryPayload(
+                          text = json.optString("text"),
+                          eventTime = eventTime,
+                          valence = valence,
+                          customMood = customMood,
+                          notebookId = notebookId,
+                          locked = json.optBoolean("locked", false),
+                          attachments = attachments,
+                      )
+                  } catch (t: Throwable) {
+                      EntryPayload(raw)
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/JournalEntry.kt" <<'EOF'
+          package com.example.journal.data
+
+          import java.time.LocalDate
+
+          /** Decrypted, in-memory view of one block inside a day. */
+          data class JournalEntry(
+              val id: Long,
+              val date: LocalDate,
+              val eventTime: Long,
+              val recordedAt: Long,
+              val updatedAt: Long,
+              val text: String,
+              val valence: Int? = null,
+              val customMood: String? = null,
+              val notebookId: Long = NotebookSet.DEFAULT_ID,
+              val locked: Boolean = false,
+              val attachments: List<String> = emptyList(),
+              val tags: List<String> = emptyList(),
+          )
+          EOF
+
+          cat > "$PKG/SettingsStore.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import androidx.core.content.edit
+
+          class SettingsStore(context: Context) {
+
+              private val prefs = context.applicationContext
+                  .getSharedPreferences("journal_settings", Context.MODE_PRIVATE)
+
+              var revealRecordedTimes: Boolean
+                  get() = prefs.getBoolean(KEY_REVEAL, false)
+                  set(value) = prefs.edit { putBoolean(KEY_REVEAL, value) }
+
+              var collapseOldDays: Boolean
+                  get() = prefs.getBoolean(KEY_COLLAPSE, true)
+                  set(value) = prefs.edit { putBoolean(KEY_COLLAPSE, value) }
+
+              /** Zero means the app never locks itself while it stays open. */
+              var autoLockMillis: Long
+                  get() = prefs.getLong(KEY_AUTO_LOCK, 2 * 60 * 1000L)
+                  set(value) = prefs.edit { putLong(KEY_AUTO_LOCK, value) }
+
+              var placeholder: String
+                  get() = prefs.getString(KEY_PLACEHOLDER, "") ?: ""
+                  set(value) = prefs.edit { putString(KEY_PLACEHOLDER, value) }
+
+              var defaultNotebookId: Long
+                  get() = prefs.getLong(KEY_DEFAULT_NOTEBOOK, NotebookSet.DEFAULT_ID)
+                  set(value) = prefs.edit { putLong(KEY_DEFAULT_NOTEBOOK, value) }
+
+              var reminderEnabled: Boolean
+                  get() = prefs.getBoolean(KEY_REMINDER_ENABLED, false)
+                  set(value) = prefs.edit { putBoolean(KEY_REMINDER_ENABLED, value) }
+
+              var reminderHour: Int
+                  get() = prefs.getInt(KEY_REMINDER_HOUR, 20)
+                  set(value) = prefs.edit { putInt(KEY_REMINDER_HOUR, value) }
+
+              var reminderMinute: Int
+                  get() = prefs.getInt(KEY_REMINDER_MINUTE, 30)
+                  set(value) = prefs.edit { putInt(KEY_REMINDER_MINUTE, value) }
+
+              private companion object {
+                  const val KEY_REVEAL = "reveal_recorded_times"
+                  const val KEY_COLLAPSE = "collapse_old_days"
+                  const val KEY_AUTO_LOCK = "auto_lock_millis"
+                  const val KEY_PLACEHOLDER = "placeholder"
+                  const val KEY_DEFAULT_NOTEBOOK = "default_notebook"
+                  const val KEY_REMINDER_ENABLED = "reminder_enabled"
+                  const val KEY_REMINDER_HOUR = "reminder_hour"
+                  const val KEY_REMINDER_MINUTE = "reminder_minute"
+              }
+          }
+          EOF
+
+          cat > "$PKG/EntryRepository.kt" <<'EOF'
+          package com.example.journal.data
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.room.withTransaction
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.withContext
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.time.LocalDate
+
+          class EntryRepository(
+              private val dao: EntryDao,
+              private val auth: AuthManager,
+              private val database: JournalDatabase,
+              private val context: Context,
+              private val attachments: AttachmentStore = AttachmentStore(context),
+              private val notebookStore: NotebookStore = NotebookStore(context),
+          ) {
+
+              fun observeEntries(): Flow<List<JournalEntry>> = dao.observeAll().map(::decryptAll)
+
+              private fun decryptAll(rows: List<Entry>): List<JournalEntry> {
+                  val key = auth.currentKeyOrNull() ?: return emptyList()
+                  return rows.mapNotNull { row ->
+                      runCatching {
+                          val payload = PayloadCodec.decode(
+                              CryptoManager.decrypt(key, row.cipherText, row.iv)
+                          )
+                          JournalEntry(
+                              id = row.id,
+                              date = LocalDate.parse(row.entryDate),
+                              eventTime = payload.eventTime ?: row.createdAt,
+                              recordedAt = row.createdAt,
+                              updatedAt = row.updatedAt,
+                              text = payload.text,
+                              valence = payload.valence,
+                              customMood = payload.customMood,
+                              notebookId = payload.notebookId ?: NotebookSet.DEFAULT_ID,
+                              locked = payload.locked,
+                              attachments = payload.attachments,
+                              tags = TagParser.tagsOf(payload.text),
+                          )
+                      }.getOrNull()
+                  }
+              }
+
+              suspend fun save(
+                  id: Long?,
+                  date: LocalDate,
+                  eventTime: Long,
+                  text: String,
+                  valence: Int?,
+                  customMood: String?,
+                  notebookId: Long,
+                  locked: Boolean,
+                  attachmentNames: List<String>,
+              ): Long {
+                  val key = auth.currentKey()
+                  val payload = EntryPayload(
+                      text = text,
+                      eventTime = eventTime,
+                      valence = valence,
+                      customMood = customMood,
+                      notebookId = notebookId,
+                      locked = locked,
+                      attachments = attachmentNames,
+                  )
+                  val encrypted = CryptoManager.encrypt(key, PayloadCodec.encode(payload))
+                  val now = System.currentTimeMillis()
+
+                  if (id == null) {
+                      return dao.insert(
+                          Entry(
+                              entryDate = date.toString(),
+                              createdAt = now,
+                              updatedAt = now,
+                              cipherText = encrypted.cipherText,
+                              iv = encrypted.iv,
+                          )
+                      )
+                  }
+
+                  val existing = dao.getById(id) ?: return -1L
+                  val previous = runCatching {
+                      PayloadCodec.decode(
+                          CryptoManager.decrypt(key, existing.cipherText, existing.iv)
+                      )
+                  }.getOrNull()
+
+                  dao.update(
+                      existing.copy(
+                          entryDate = date.toString(),
+                          updatedAt = now,
+                          cipherText = encrypted.cipherText,
+                          iv = encrypted.iv,
+                      )
+                  )
+
+                  previous?.attachments
+                      ?.minus(attachmentNames.toSet())
+                      ?.forEach { attachments.delete(it) }
+
+                  return id
+              }
+
+              suspend fun delete(id: Long) {
+                  val row = dao.getById(id) ?: return
+                  auth.currentKeyOrNull()?.let { key ->
+                      runCatching {
+                          PayloadCodec.decode(CryptoManager.decrypt(key, row.cipherText, row.iv))
+                      }.getOrNull()?.attachments?.forEach { attachments.delete(it) }
+                  }
+                  dao.deleteById(id)
+              }
+
+              suspend fun addAttachment(bytes: ByteArray): String? = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext null
+                  runCatching { attachments.save(key, bytes) }.getOrNull()
+              }
+
+              suspend fun loadAttachment(name: String): ByteArray? = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext null
+                  attachments.load(key, name)
+              }
+
+              suspend fun cleanUpAttachments(): Int = withContext(Dispatchers.IO) {
+                  val key = auth.currentKeyOrNull() ?: return@withContext 0
+                  val referenced = dao.getAll().flatMapTo(mutableSetOf()) { row ->
+                      runCatching {
+                          PayloadCodec.decode(CryptoManager.decrypt(key, row.cipherText, row.iv))
+                      }.getOrDefault(EntryPayload("")).attachments
+                  }
+                  attachments.collectGarbage(referenced)
+              }
+
+              // ------------------------------------------------------------- notebooks
+
+              suspend fun notebooks(): NotebookSet = withContext(Dispatchers.IO) {
+                  notebookStore.load(auth.currentKey())
+              }
+
+              suspend fun saveNotebooks(set: NotebookSet) = withContext(Dispatchers.IO) {
+                  notebookStore.save(auth.currentKey(), set)
+              }
+
+              /** Moves every block out of [notebookId] into [fallbackId]. Returns how many moved. */
+              suspend fun reassignNotebook(notebookId: Long, fallbackId: Long): Int =
+                  withContext(Dispatchers.IO) {
+                      val key = auth.currentKey()
+                      val rows = dao.getAll()
+                      val changed = mutableListOf<Entry>()
+
+                      rows.forEach { row ->
+                          val payload = runCatching {
+                              PayloadCodec.decode(
+                                  CryptoManager.decrypt(key, row.cipherText, row.iv)
+                              )
+                          }.getOrNull() ?: return@forEach
+
+                          val current = payload.notebookId ?: NotebookSet.DEFAULT_ID
+                          if (current != notebookId) return@forEach
+
+                          val encrypted = CryptoManager.encrypt(
+                              key,
+                              PayloadCodec.encode(payload.copy(notebookId = fallbackId)),
+                          )
+                          changed += row.copy(cipherText = encrypted.cipherText, iv = encrypted.iv)
+                      }
+
+                      if (changed.isNotEmpty()) dao.updateAll(changed)
+                      changed.size
+                  }
+
+              // ---------------------------------------------------------- password
+
+              suspend fun changePassword(current: CharArray, new: CharArray): Boolean {
+                  if (!auth.unlock(current)) return false
+
+                  val oldKey = auth.currentKey()
+                  val rows = dao.getAll()
+                  val notebooks = notebookStore.load(oldKey)
+
+                  val newSalt = CryptoManager.newSalt()
+                  val newKey = CryptoManager.deriveKey(new, newSalt)
+
+                  val reEncrypted = rows.map { row ->
+                      val plain = CryptoManager.decrypt(oldKey, row.cipherText, row.iv)
+                      val encrypted = CryptoManager.encrypt(newKey, plain)
+                      row.copy(cipherText = encrypted.cipherText, iv = encrypted.iv)
+                  }
+
+                  database.withTransaction { dao.updateAll(reEncrypted) }
+                  notebookStore.save(newKey, notebooks)
+                  auth.replacePassword(newSalt, newKey)
+                  return true
+              }
+
+              // ------------------------------------------------------------- backup
+
+              suspend fun exportTo(uri: Uri): Int = withContext(Dispatchers.IO) {
+                  val key = auth.currentKey()
+                  val salt = auth.saltCopy() ?: error("The journal has no password set.")
+                  val rows = dao.getAll()
+
+                  val entriesJson = JSONArray()
+                  rows.forEach { row ->
+                      val payload = PayloadCodec.decode(
+                          CryptoManager.decrypt(key, row.cipherText, row.iv)
+                      )
+
+                      val photosJson = JSONArray()
+                      payload.attachments.forEach { name ->
+                          attachments.load(key, name)?.let { bytes ->
+                              val photo = JSONObject()
+                              photo.put("name", name)
+                              photo.put("data", CryptoManager.encode(bytes))
+                              photosJson.put(photo)
+                          }
+                      }
+
+                      val item = JSONObject()
+                      item.put("date", row.entryDate)
+                      item.put("recordedAt", row.createdAt)
+                      item.put("eventTime", payload.eventTime ?: row.createdAt)
+                      item.put("updatedAt", row.updatedAt)
+                      item.put("text", payload.text)
+                      payload.valence?.let { item.put("valence", it) }
+                      payload.customMood?.let { item.put("customMood", it) }
+                      payload.notebookId?.let { item.put("notebook", it) }
+                      if (payload.locked) item.put("locked", true)
+                      if (photosJson.length() > 0) item.put("attachments", photosJson)
+                      entriesJson.put(item)
+                  }
+
+                  val inner = JSONObject()
+                  inner.put("version", 4)
+                  inner.put("notebooks", encodeNotebooks(notebookStore.load(key)))
+                  inner.put("entries", entriesJson)
+
+                  val encrypted = CryptoManager.encrypt(key, inner.toString())
+
+                  val envelope = JSONObject()
+                  envelope.put("app", "journal")
+                  envelope.put("version", 4)
+                  envelope.put("exportedAt", System.currentTimeMillis())
+
+                  val kdf = JSONObject()
+                  kdf.put("algo", CryptoManager.PBKDF2_ALGORITHM)
+                  kdf.put("iterations", CryptoManager.ITERATIONS)
+                  kdf.put("salt", CryptoManager.encode(salt))
+                  envelope.put("kdf", kdf)
+
+                  val cipher = JSONObject()
+                  cipher.put("algo", CryptoManager.TRANSFORMATION)
+                  cipher.put("iv", encrypted.iv)
+                  cipher.put("data", encrypted.cipherText)
+                  envelope.put("cipher", cipher)
+
+                  context.contentResolver.openOutputStream(uri).use { stream ->
+                      if (stream == null) error("Could not open the destination file.")
+                      stream.write(envelope.toString(2).toByteArray(Charsets.UTF_8))
+                  }
+                  rows.size
+              }
+
+              suspend fun importFrom(uri: Uri, password: CharArray): Int = withContext(Dispatchers.IO) {
+                  val fileText = context.contentResolver.openInputStream(uri)?.use {
+                      it.readBytes().toString(Charsets.UTF_8)
+                  } ?: error("Could not read that file.")
+
+                  val envelope = runCatching { JSONObject(fileText) }
+                      .getOrElse { error("That file isn't a readable Journal backup.") }
+                  require(envelope.optString("app") == "journal") { "That file isn't a Journal backup." }
+
+                  val kdf = envelope.getJSONObject("kdf")
+                  val cipher = envelope.getJSONObject("cipher")
+                  val salt = CryptoManager.decode(kdf.getString("salt"))
+                  val iterations = kdf.optInt("iterations", CryptoManager.ITERATIONS)
+
+                  val fileKey = CryptoManager.deriveKey(password, salt, iterations)
+                  val inner = runCatching {
+                      CryptoManager.decrypt(
+                          fileKey,
+                          cipher.getString("data"),
+                          cipher.getString("iv"),
+                      )
+                  }.getOrElse { error("Wrong password for this backup, or the file is damaged.") }
+
+                  val root = runCatching { JSONObject(inner) }
+                      .getOrElse { error("This backup looks corrupted inside.") }
+                  val incoming = runCatching { root.getJSONArray("entries") }
+                      .getOrElse { error("This backup has no entries in it.") }
+
+                  val key = auth.currentKey()
+                  val merged = mergeNotebooks(notebookStore.load(key), root.optJSONArray("notebooks"))
+                  notebookStore.save(key, merged)
+                  val known = merged.notebooks.map { it.id }.toSet()
+                  val fallback = merged.displayOrder.firstOrNull()?.id ?: NotebookSet.DEFAULT_ID
+
+                  val now = System.currentTimeMillis()
+                  val rows = buildList {
+                      for (i in 0 until incoming.length()) {
+                          val item = incoming.optJSONObject(i) ?: continue
+                          val date = runCatching { LocalDate.parse(item.getString("date")) }
+                              .getOrNull() ?: continue
+                          val text = item.optString("text")
+                          if (text.isBlank()) continue
+
+                          val valence = if (item.has("valence") && !item.isNull("valence"))
+                              item.optInt("valence").coerceIn(MoodScale.MIN, MoodScale.MAX) else null
+                          val custom = item.optString("customMood")
+                              .takeIf { it.isNotBlank() && !item.isNull("customMood") }
+                          val recordedAt = item.optLong("recordedAt", now)
+                          val eventTime = item.optLong("eventTime", recordedAt)
+                          val notebook = item.optLong("notebook", 0L).takeIf { it in known }
+
+                          val photos = item.optJSONArray("attachments")
+                          val names = buildList {
+                              if (photos != null) {
+                                  for (p in 0 until photos.length()) {
+                                      val photo = photos.optJSONObject(p) ?: continue
+                                      val bytes = runCatching {
+                                          CryptoManager.decode(photo.getString("data"))
+                                      }.getOrNull() ?: continue
+                                      runCatching { attachments.save(key, bytes) }
+                                          .getOrNull()?.let { add(it) }
+                                  }
+                              }
+                          }
+
+                          val encrypted = CryptoManager.encrypt(
+                              key,
+                              PayloadCodec.encode(
+                                  EntryPayload(
+                                      text = text,
+                                      eventTime = eventTime,
+                                      valence = valence,
+                                      customMood = custom,
+                                      notebookId = notebook ?: fallback,
+                                      locked = item.optBoolean("locked", false),
+                                      attachments = names,
+                                  )
+                              ),
+                          )
+
+                          add(
+                              Entry(
+                                  entryDate = date.toString(),
+                                  createdAt = recordedAt,
+                                  updatedAt = item.optLong("updatedAt", now),
+                                  cipherText = encrypted.cipherText,
+                                  iv = encrypted.iv,
+                              )
+                          )
+                      }
+                  }
+
+                  if (rows.isNotEmpty()) dao.insertAll(rows)
+                  rows.size
+              }
+
+              private fun encodeNotebooks(set: NotebookSet): JSONArray {
+                  val array = JSONArray()
+                  set.notebooks.forEach { notebook ->
+                      val item = JSONObject()
+                      item.put("id", notebook.id)
+                      item.put("name", notebook.name)
+                      item.put("pinned", notebook.pinned)
+                      item.put("order", notebook.order)
+                      array.put(item)
+                  }
+                  return array
+              }
+
+              private fun mergeNotebooks(local: NotebookSet, incoming: JSONArray?): NotebookSet {
+                  if (incoming == null || incoming.length() == 0) return local
+                  val byId = local.notebooks.associateBy { it.id }.toMutableMap()
+                  for (i in 0 until incoming.length()) {
+                      val item = incoming.optJSONObject(i) ?: continue
+                      val id = item.optLong("id", 0L)
+                      val name = item.optString("name")
+                      if (id <= 0L || name.isBlank() || byId.containsKey(id)) continue
+                      byId[id] = Notebook(
+                          id = id,
+                          name = name,
+                          pinned = item.optBoolean("pinned", false),
+                          order = item.optInt("order", byId.size),
+                      )
+                  }
+                  return NotebookSet(byId.values.sortedBy { it.order })
+              }
+          }
+          EOF
+
+      - name: Write view model and activity
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal
+          mkdir -p "$PKG"
+
+          cat > "$PKG/JournalViewModel.kt" <<'EOF'
+          package com.example.journal
+
+          import android.content.Context
+          import android.net.Uri
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.lifecycle.ViewModel
+          import androidx.lifecycle.ViewModelProvider
+          import androidx.lifecycle.viewModelScope
+          import com.example.journal.data.AuthManager
+          import com.example.journal.data.EntryRepository
+          import com.example.journal.data.ImageCompressor
+          import com.example.journal.data.JournalEntry
+          import com.example.journal.data.MoodScale
+          import com.example.journal.data.MoodScaleStore
+          import com.example.journal.data.Notebook
+          import com.example.journal.data.NotebookSet
+          import com.example.journal.data.SettingsStore
+          import com.example.journal.ui.JournalStats
+          import com.example.journal.ui.MoodPoint
+          import com.example.journal.ui.OnThisDayHit
+          import com.example.journal.ui.computeMoodSeries
+          import com.example.journal.ui.computeOnThisDay
+          import com.example.journal.ui.computeStats
+          import com.example.journal.ui.decodeSampled
+          import com.example.journal.ui.hourOfDay
+          import com.example.journal.ui.minuteOfHour
+          import com.example.journal.ui.timeLabel
+          import com.example.journal.widget.JournalWidget
+          import com.example.journal.work.ReminderScheduler
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.ExperimentalCoroutinesApi
+          import kotlinx.coroutines.Job
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.SharingStarted
+          import kotlinx.coroutines.flow.StateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import kotlinx.coroutines.flow.flatMapLatest
+          import kotlinx.coroutines.flow.flowOf
+          import kotlinx.coroutines.flow.map
+          import kotlinx.coroutines.flow.stateIn
+          import kotlinx.coroutines.flow.update
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.time.LocalDate
+
+          sealed interface LockState {
+              data object NeedsSetup : LockState
+              data object Locked : LockState
+              data object Unlocked : LockState
+          }
+
+          /**
+           * The block open in the editor. It lives here rather than in the composable so
+           * a background auto-lock never throws away unsaved text.
+           */
+          data class EditorState(
+              val entryId: Long?,
+              val originalText: String,
+              val originalDate: LocalDate,
+              val originalEventTime: Long,
+              val originalValence: Int?,
+              val originalCustomMood: String?,
+              val originalNotebookId: Long,
+              val originalLocked: Boolean,
+              val originalAttachments: List<String>,
+              val text: String,
+              val date: LocalDate,
+              val eventTime: Long,
+              val valence: Int?,
+              val customMood: String?,
+              val notebookId: Long,
+              val locked: Boolean,
+              val attachments: List<String>,
+              val merged: Boolean = false,
+              val recordedAt: Long? = null,
+              val updatedAt: Long? = null,
+          ) {
+              val isNew: Boolean get() = entryId == null
+
+              val isDirty: Boolean
+                  get() = text != originalText ||
+                          date != originalDate ||
+                          eventTime != originalEventTime ||
+                          valence != originalValence ||
+                          customMood != originalCustomMood ||
+                          notebookId != originalNotebookId ||
+                          locked != originalLocked ||
+                          attachments != originalAttachments
+
+              /** True while the merge banner can still be dismissed without losing typing. */
+              val canUndoMerge: Boolean get() = merged && text == originalText
+          }
+
+          data class ReminderSettings(val enabled: Boolean, val hour: Int, val minute: Int)
+
+          data class UiMessage(val id: Long, val text: String)
+
+          @OptIn(ExperimentalCoroutinesApi::class)
+          class JournalViewModel(
+              private val repository: EntryRepository,
+              private val auth: AuthManager,
+              private val settings: SettingsStore,
+              private val appContext: Context,
+          ) : ViewModel() {
+
+              private val moodScaleStore = MoodScaleStore(appContext)
+
+              private val _lockState = MutableStateFlow<LockState>(
+                  if (auth.hasPassword) LockState.Locked else LockState.NeedsSetup
+              )
+              val lockState: StateFlow<LockState> = _lockState.asStateFlow()
+
+              private val _authError = MutableStateFlow<String?>(null)
+              val authError: StateFlow<String?> = _authError.asStateFlow()
+
+              private val _authBusy = MutableStateFlow(false)
+              val authBusy: StateFlow<Boolean> = _authBusy.asStateFlow()
+
+              private val _editor = MutableStateFlow<EditorState?>(null)
+              val editor: StateFlow<EditorState?> = _editor.asStateFlow()
+
+              private val _revealedEntries = MutableStateFlow<Set<Long>>(emptySet())
+              val revealedEntries: StateFlow<Set<Long>> = _revealedEntries.asStateFlow()
+
+              /** User overrides for day collapsing. Cleared whenever the journal locks. */
+              private val _expansion = MutableStateFlow<Map<LocalDate, Boolean>>(emptyMap())
+              val expansion: StateFlow<Map<LocalDate, Boolean>> = _expansion.asStateFlow()
+
+              private val _notebooks = MutableStateFlow(NotebookSet.DEFAULT)
+              val notebooks: StateFlow<NotebookSet> = _notebooks.asStateFlow()
+
+              private val _moodScale = MutableStateFlow(moodScaleStore.load())
+              val moodScale: StateFlow<MoodScale> = _moodScale.asStateFlow()
+
+              private val _revealRecordedTimes = MutableStateFlow(settings.revealRecordedTimes)
+              val revealRecordedTimes: StateFlow<Boolean> = _revealRecordedTimes.asStateFlow()
+
+              private val _collapseOldDays = MutableStateFlow(settings.collapseOldDays)
+              val collapseOldDays: StateFlow<Boolean> = _collapseOldDays.asStateFlow()
+
+              private val _autoLockMillis = MutableStateFlow(settings.autoLockMillis)
+              val autoLockMillis: StateFlow<Long> = _autoLockMillis.asStateFlow()
+
+              private val _placeholder = MutableStateFlow(settings.placeholder)
+              val placeholder: StateFlow<String> = _placeholder.asStateFlow()
+
+              private val _defaultNotebookId = MutableStateFlow(settings.defaultNotebookId)
+              val defaultNotebookId: StateFlow<Long> = _defaultNotebookId.asStateFlow()
+
+              private val _reminder = MutableStateFlow(
+                  ReminderSettings(settings.reminderEnabled, settings.reminderHour, settings.reminderMinute)
+              )
+              val reminder: StateFlow<ReminderSettings> = _reminder.asStateFlow()
+
+              private val _message = MutableStateFlow<UiMessage?>(null)
+              val message: StateFlow<UiMessage?> = _message.asStateFlow()
+
+              private val _transferInProgress = MutableStateFlow(false)
+              val transferInProgress: StateFlow<Boolean> = _transferInProgress.asStateFlow()
+
+              private var pendingLock: Job? = null
+              private var pendingNewEntry = false
+
+              private val thumbnails = HashMap<String, ImageBitmap>()
+
+              val entries: StateFlow<List<JournalEntry>> = _lockState
+                  .flatMapLatest { state ->
+                      if (state == LockState.Unlocked) repository.observeEntries()
+                      else flowOf(emptyList())
+                  }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+              val stats: StateFlow<JournalStats> = entries
+                  .map { computeStats(it) }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, JournalStats())
+
+              val moodSeries: StateFlow<List<MoodPoint>> = entries
+                  .map { computeMoodSeries(it, 30, LocalDate.now()) }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+              val onThisDay: StateFlow<List<OnThisDayHit>> = entries
+                  .map { computeOnThisDay(it, LocalDate.now()) }
+                  .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+              init {
+                  viewModelScope.launch {
+                      stats.collect { current ->
+                          if (_lockState.value == LockState.Unlocked && current.blocks > 0) {
+                              JournalWidget.push(appContext, current)
+                          }
+                      }
+                  }
+              }
+
+              // --------------------------------------------------------------- locking
+
+              fun setupPassword(password: String, confirm: String) {
+                  val error = when {
+                      password.length < MIN_PASSWORD_LENGTH ->
+                          "Use at least " + MIN_PASSWORD_LENGTH + " characters."
+                      password != confirm -> "Those passwords don't match."
+                      else -> null
+                  }
+                  if (error != null) {
+                      _authError.value = error
+                      return
+                  }
+
+                  _authBusy.value = true
+                  viewModelScope.launch {
+                      val created = withContext(Dispatchers.Default) {
+                          auth.setupPassword(password.toCharArray())
+                      }
+                      _authBusy.value = false
+                      if (!created) {
+                          _authError.value = "This journal already has a password."
+                          return@launch
+                      }
+                      _authError.value = null
+                      _lockState.value = LockState.Unlocked
+                      afterUnlock()
+                  }
+              }
+
+              fun unlock(password: String) {
+                  _authBusy.value = true
+                  viewModelScope.launch {
+                      val ok = withContext(Dispatchers.Default) {
+                          auth.unlock(password.toCharArray())
+                      }
+                      _authBusy.value = false
+                      _authError.value = if (ok) null else "Wrong password."
+                      if (ok) {
+                          _lockState.value = LockState.Unlocked
+                          afterUnlock()
+                      }
+                  }
+              }
+
+              fun revealEntry(entryId: Long, password: String, onResult: (Boolean) -> Unit) {
+                  viewModelScope.launch {
+                      val ok = withContext(Dispatchers.Default) {
+                          auth.unlock(password.toCharArray())
+                      }
+                      if (ok) _revealedEntries.update { it + entryId }
+                      onResult(ok)
+                  }
+              }
+
+              private fun afterUnlock() {
+                  if (pendingNewEntry) {
+                      pendingNewEntry = false
+                      openNewEntry()
+                  }
+                  viewModelScope.launch {
+                      val set = repository.notebooks()
+                      _notebooks.value = set
+                      repository.saveNotebooks(set)
+                      repository.cleanUpAttachments()
+                  }
+              }
+
+              fun requestNewEntry() {
+                  if (_lockState.value == LockState.Unlocked) openNewEntry() else pendingNewEntry = true
+              }
+
+              fun lock() {
+                  if (_lockState.value != LockState.Unlocked) return
+                  pendingLock?.cancel()
+                  pendingLock = null
+                  auth.lock()
+                  _revealedEntries.value = emptySet()
+                  _expansion.value = emptyMap()
+                  thumbnails.clear()
+                  _lockState.value = LockState.Locked
+              }
+
+              fun scheduleLock() {
+                  if (_lockState.value != LockState.Unlocked) return
+                  val delayMillis = _autoLockMillis.value
+                  if (delayMillis <= 0L) return
+                  pendingLock?.cancel()
+                  pendingLock = viewModelScope.launch {
+                      delay(delayMillis)
+                      lock()
+                  }
+              }
+
+              fun cancelPendingLock() {
+                  pendingLock?.cancel()
+                  pendingLock = null
+              }
+
+              fun toggleDay(date: LocalDate, currentlyExpanded: Boolean) {
+                  _expansion.update { it + (date to !currentlyExpanded) }
+              }
+
+              // ---------------------------------------------------------------- editor
+
+              fun openNewEntry() = openNewEntry(LocalDate.now(), null)
+
+              fun openNewEntry(date: LocalDate, notebookId: Long?) =
+                  beginNewBlock(date, notebookId, forceNew = false)
+
+              private fun beginNewBlock(date: LocalDate, notebookId: Long?, forceNew: Boolean) {
+                  val target = notebookId ?: resolvedDefaultNotebookId()
+
+                  if (!forceNew && date == LocalDate.now()) {
+                      val now = System.currentTimeMillis()
+                      val recent = entries.value
+                          .filter { it.date == date && !it.locked && it.notebookId == target }
+                          .maxByOrNull { it.updatedAt }
+                      if (recent != null && now - recent.updatedAt <= MERGE_WINDOW_MILLIS) {
+                          post("Continuing your " + recent.eventTime.timeLabel() + " block.")
+                          openExisting(recent, merged = true)
+                          return
+                      }
+                  }
+
+                  val eventTime = date.atTimeOfDay(
+                      System.currentTimeMillis().hourOfDay(),
+                      System.currentTimeMillis().minuteOfHour(),
+                  )
+                  _editor.value = EditorState(
+                      entryId = null,
+                      originalText = "",
+                      originalDate = date,
+                      originalEventTime = eventTime,
+                      originalValence = null,
+                      originalCustomMood = null,
+                      originalNotebookId = target,
+                      originalLocked = false,
+                      originalAttachments = emptyList(),
+                      text = "",
+                      date = date,
+                      eventTime = eventTime,
+                      valence = null,
+                      customMood = null,
+                      notebookId = target,
+                      locked = false,
+                      attachments = emptyList(),
+                  )
+              }
+
+              /** Abandons a merge and starts a genuinely new block instead. */
+              fun startNewBlock() {
+                  val current = _editor.value ?: return
+                  if (!current.canUndoMerge) return
+                  beginNewBlock(current.date, current.notebookId, forceNew = true)
+              }
+
+              fun openEntry(entry: JournalEntry) = openExisting(entry, merged = false)
+
+              private fun openExisting(entry: JournalEntry, merged: Boolean) {
+                  _editor.value = EditorState(
+                      entryId = entry.id,
+                      originalText = entry.text,
+                      originalDate = entry.date,
+                      originalEventTime = entry.eventTime,
+                      originalValence = entry.valence,
+                      originalCustomMood = entry.customMood,
+                      originalNotebookId = entry.notebookId,
+                      originalLocked = entry.locked,
+                      originalAttachments = entry.attachments,
+                      text = entry.text,
+                      date = entry.date,
+                      eventTime = entry.eventTime,
+                      valence = entry.valence,
+                      customMood = entry.customMood,
+                      notebookId = entry.notebookId,
+                      locked = entry.locked,
+                      attachments = entry.attachments,
+                      merged = merged,
+                      recordedAt = entry.recordedAt,
+                      updatedAt = entry.updatedAt,
+                  )
+              }
+
+              fun updateText(text: String) {
+                  _editor.update { it?.copy(text = text) }
+              }
+
+              fun setDate(date: LocalDate) {
+                  _editor.update { current ->
+                      if (current == null) null
+                      else current.copy(
+                          date = date,
+                          eventTime = date.atTimeOfDay(
+                              current.eventTime.hourOfDay(),
+                              current.eventTime.minuteOfHour(),
+                          ),
+                      )
+                  }
+              }
+
+              fun setTime(hour: Int, minute: Int) {
+                  _editor.update { current ->
+                      current?.copy(eventTime = current.date.atTimeOfDay(hour, minute))
+                  }
+              }
+
+              fun setValence(valence: Int?) {
+                  _editor.update { it?.copy(valence = valence, customMood = null) }
+              }
+
+              fun setCustomMood(emoji: String?) {
+                  _editor.update { it?.copy(customMood = emoji, valence = null) }
+              }
+
+              fun setDraftNotebook(notebookId: Long) {
+                  _editor.update { it?.copy(notebookId = notebookId) }
+              }
+
+              fun toggleDraftLock() {
+                  _editor.update { it?.copy(locked = !it.locked) }
+              }
+
+              fun removePhoto(name: String) {
+                  _editor.update { it?.copy(attachments = it.attachments - name) }
+              }
+
+              fun closeEditor() {
+                  _editor.value = null
+              }
+
+              fun saveDraft() {
+                  val draft = _editor.value ?: return
+                  if (draft.text.isBlank()) return
+                  viewModelScope.launch {
+                      repository.save(
+                          id = draft.entryId,
+                          date = draft.date,
+                          eventTime = draft.eventTime,
+                          text = draft.text.trim(),
+                          valence = draft.valence,
+                          customMood = draft.customMood,
+                          notebookId = draft.notebookId,
+                          locked = draft.locked,
+                          attachmentNames = draft.attachments,
+                      )
+                      _editor.value = null
+                  }
+              }
+
+              fun deleteEntry(id: Long) {
+                  viewModelScope.launch {
+                      repository.delete(id)
+                      if (_editor.value?.entryId == id) _editor.value = null
+                  }
+              }
+
+              // ---------------------------------------------------------------- photos
+
+              fun addPhotoFromUri(uri: Uri) {
+                  ingestPhoto {
+                      withContext(Dispatchers.IO) {
+                          appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                      }
+                  }
+              }
+
+              fun addPhotoFromFile(file: File) {
+                  ingestPhoto {
+                      withContext(Dispatchers.IO) {
+                          val bytes = file.takeIf { it.isFile }?.readBytes()
+                          file.delete()
+                          bytes
+                      }
+                  }
+              }
+
+              private fun ingestPhoto(loader: suspend () -> ByteArray?) {
+                  if (_editor.value == null) return
+                  viewModelScope.launch {
+                      val raw = loader()
+                      if (raw == null) {
+                          post("That picture could not be read.")
+                          return@launch
+                      }
+                      val compressed = withContext(Dispatchers.Default) {
+                          ImageCompressor.fromBytes(raw)
+                      }
+                      if (compressed == null) {
+                          post("That file doesn't look like a picture.")
+                          return@launch
+                      }
+                      val name = repository.addAttachment(compressed)
+                      if (name == null) {
+                          post("Could not save the picture.")
+                          return@launch
+                      }
+                      _editor.update { it?.copy(attachments = it.attachments + name) }
+                  }
+              }
+
+              suspend fun thumbnailFor(name: String): ImageBitmap? {
+                  thumbnails[name]?.let { return it }
+                  val bytes = repository.loadAttachment(name) ?: return null
+                  val bitmap = withContext(Dispatchers.Default) { decodeSampled(bytes, 220) }
+                  if (bitmap != null) {
+                      if (thumbnails.size > 64) thumbnails.clear()
+                      thumbnails[name] = bitmap
+                  }
+                  return bitmap
+              }
+
+              suspend fun fullImageFor(name: String): ImageBitmap? {
+                  val bytes = repository.loadAttachment(name) ?: return null
+                  return withContext(Dispatchers.Default) { decodeSampled(bytes, 2048) }
+              }
+
+              // ------------------------------------------------------------- notebooks
+
+              private fun resolvedDefaultNotebookId(): Long {
+                  val set = _notebooks.value
+                  val configured = _defaultNotebookId.value
+                  return if (set.byId(configured) != null) configured
+                  else set.firstId ?: NotebookSet.DEFAULT_ID
+              }
+
+              fun createNotebook(name: String, select: Boolean = false) {
+                  val trimmed = name.trim()
+                  if (trimmed.isEmpty()) return
+                  viewModelScope.launch {
+                      val current = _notebooks.value
+                      if (current.notebooks.any { it.name.equals(trimmed, ignoreCase = true) }) {
+                          post("You already have a notebook called \"" + trimmed + "\".")
+                          return@launch
+                      }
+                      val nextId = (current.notebooks.maxOfOrNull { it.id } ?: 0L) + 1L
+                      val updated = NotebookSet(
+                          current.notebooks +
+                              Notebook(nextId, trimmed, pinned = false, order = current.notebooks.size)
+                      )
+                      repository.saveNotebooks(updated)
+                      _notebooks.value = updated
+                      if (select) _editor.update { it?.copy(notebookId = nextId) }
+                  }
+              }
+
+              fun renameNotebook(id: Long, name: String) {
+                  val trimmed = name.trim()
+                  if (trimmed.isEmpty()) return
+                  viewModelScope.launch {
+                      val current = _notebooks.value
+                      if (current.notebooks.any {
+                              it.id != id && it.name.equals(trimmed, ignoreCase = true)
+                          }
+                      ) {
+                          post("Another notebook is already called \"" + trimmed + "\".")
+                          return@launch
+                      }
+                      val updated = NotebookSet(
+                          current.notebooks.map {
+                              if (it.id == id) it.copy(name = trimmed) else it
+                          }
+                      )
+                      repository.saveNotebooks(updated)
+                      _notebooks.value = updated
+                  }
+              }
+
+              fun toggleNotebookPin(id: Long) {
+                  viewModelScope.launch {
+                      val current = _notebooks.value
+                      val updated = NotebookSet(
+                          current.notebooks.map {
+                              if (it.id == id) it.copy(pinned = !it.pinned) else it
+                          }
+                      )
+                      repository.saveNotebooks(updated)
+                      _notebooks.value = updated
+                  }
+              }
+
+              fun deleteNotebook(id: Long) {
+                  viewModelScope.launch {
+                      val current = _notebooks.value
+                      if (current.notebooks.size <= 1) {
+                          post("Keep at least one notebook.")
+                          return@launch
+                      }
+                      val remaining = current.notebooks.filterNot { it.id == id }
+                      val fallback = NotebookSet(remaining).displayOrder.first().id
+                      val moved = repository.reassignNotebook(id, fallback)
+                      val updated = NotebookSet(remaining)
+                      repository.saveNotebooks(updated)
+                      _notebooks.value = updated
+
+                      if (_defaultNotebookId.value == id) setDefaultNotebook(fallback)
+                      if (_editor.value?.notebookId == id) {
+                          _editor.update { it?.copy(notebookId = fallback) }
+                      }
+                      post(
+                          if (moved == 0) "Notebook removed."
+                          else "Notebook removed and " + moved + " block(s) moved."
+                      )
+                  }
+              }
+
+              // -------------------------------------------------------------- settings
+
+              fun setRevealRecordedTimes(value: Boolean) {
+                  settings.revealRecordedTimes = value
+                  _revealRecordedTimes.value = value
+              }
+
+              fun setCollapseOldDays(value: Boolean) {
+                  settings.collapseOldDays = value
+                  _collapseOldDays.value = value
+              }
+
+              fun setAutoLock(millis: Long) {
+                  settings.autoLockMillis = millis
+                  _autoLockMillis.value = millis
+                  if (millis > 0L && pendingLock != null) scheduleLock()
+              }
+
+              fun setPlaceholder(value: String) {
+                  settings.placeholder = value
+                  _placeholder.value = value
+              }
+
+              fun setDefaultNotebook(id: Long) {
+                  settings.defaultNotebookId = id
+                  _defaultNotebookId.value = id
+              }
+
+              fun setMoodEmoji(index: Int, emoji: String) {
+                  val updated = _moodScale.value.withEmoji(index, emoji)
+                  moodScaleStore.save(updated)
+                  _moodScale.value = updated
+              }
+
+              fun setMoodLabel(index: Int, label: String) {
+                  val updated = _moodScale.value.withLabel(index, label)
+                  moodScaleStore.save(updated)
+                  _moodScale.value = updated
+              }
+
+              fun resetMoodScale() {
+                  moodScaleStore.reset()
+                  _moodScale.value = MoodScale.DEFAULT
+                  post("Mood scale reset.")
+              }
+
+              fun setReminder(enabled: Boolean, hour: Int, minute: Int) {
+                  settings.reminderEnabled = enabled
+                  settings.reminderHour = hour
+                  settings.reminderMinute = minute
+                  _reminder.value = ReminderSettings(enabled, hour, minute)
+
+                  if (enabled) {
+                      ReminderScheduler.schedule(appContext, hour, minute)
+                      post("Daily reminder set for " + "%02d:%02d".format(hour, minute) + ".")
+                  } else {
+                      ReminderScheduler.cancel(appContext)
+                      post("Daily reminder turned off.")
+                  }
+              }
+
+              fun changePassword(current: String, new: String, onResult: (String?) -> Unit) {
+                  viewModelScope.launch {
+                      val result = when {
+                          new.length < MIN_PASSWORD_LENGTH ->
+                              "New password must be at least " + MIN_PASSWORD_LENGTH + " characters."
+                          withContext(Dispatchers.Default) {
+                              repository.changePassword(current.toCharArray(), new.toCharArray())
+                          } -> null
+                          else -> "Current password is incorrect."
+                      }
+                      onResult(result)
+                  }
+              }
+
+              // ---------------------------------------------------------------- backup
+
+              fun exportTo(uri: Uri) {
+                  _transferInProgress.value = true
+                  viewModelScope.launch {
+                      val result = runCatching { repository.exportTo(uri) }
+                      _transferInProgress.value = false
+                      post(
+                          result.fold(
+                              onSuccess = { count ->
+                                  if (count == 0) "Nothing to export yet."
+                                  else "Exported " + count + " " + blocks(count) + "."
+                              },
+                              onFailure = { "Export failed: " + (it.message ?: "unknown error") },
+                          )
+                      )
+                  }
+              }
+
+              fun importFrom(uri: Uri, password: String) {
+                  if (password.isBlank()) {
+                      post("Enter the password for that backup.")
+                      return
+                  }
+                  _transferInProgress.value = true
+                  viewModelScope.launch {
+                      val result = runCatching {
+                          repository.importFrom(uri, password.toCharArray())
+                      }
+                      _transferInProgress.value = false
+                      _notebooks.value = repository.notebooks()
+                      post(
+                          result.fold(
+                              onSuccess = { count ->
+                                  if (count == 0) "That backup had no blocks in it."
+                                  else "Imported " + count + " " + blocks(count) + "."
+                              },
+                              onFailure = { it.message ?: "Import failed." },
+                          )
+                      )
+                  }
+              }
+
+              // -------------------------------------------------------------- messages
+
+              fun clearMessage() {
+                  _message.value = null
+              }
+
+              private fun post(text: String) {
+                  _message.value = UiMessage(System.nanoTime(), text)
+              }
+
+              private fun blocks(count: Int) = if (count == 1) "block" else "blocks"
+
+              companion object {
+                  const val MIN_PASSWORD_LENGTH = 6
+                  const val MERGE_WINDOW_MILLIS = 30 * 60 * 1000L
+              }
+          }
+
+          class JournalViewModelFactory(
+              private val app: JournalApplication,
+          ) : ViewModelProvider.Factory {
+
+              @Suppress("UNCHECKED_CAST")
+              override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                  if (modelClass.isAssignableFrom(JournalViewModel::class.java)) {
+                      return JournalViewModel(
+                          repository = app.repository,
+                          auth = app.authManager,
+                          settings = app.settingsStore,
+                          appContext = app.applicationContext,
+                      ) as T
+                  }
+                  throw IllegalArgumentException("Unknown ViewModel: " + modelClass.name)
+              }
+          }
+          EOF
+
+      - name: Write UI helpers
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+          mkdir -p "$PKG"
+
+          cat > "$PKG/DateUtils.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import java.time.Instant
+          import java.time.LocalDate
+          import java.time.LocalTime
+          import java.time.ZoneId
+          import java.time.ZoneOffset
+          import java.time.format.DateTimeFormatter
+
+          private val longDate = DateTimeFormatter.ofPattern("EEEE, d MMMM yyyy")
+          private val shortDate = DateTimeFormatter.ofPattern("d MMM yyyy")
+          private val stamp = DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm")
+          private val clock = DateTimeFormatter.ofPattern("HH:mm")
+
+          fun LocalDate.toUtcMillis(): Long = atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+
+          fun Long.utcToLocalDate(): LocalDate =
+              Instant.ofEpochMilli(this).atZone(ZoneOffset.UTC).toLocalDate()
+
+          fun LocalDate.prettyLabel(): String {
+              val today = LocalDate.now()
+              val base = format(longDate)
+              return when (this) {
+                  today -> "Today · " + base
+                  today.minusDays(1) -> "Yesterday · " + base
+                  else -> base
+              }
+          }
+
+          fun LocalDate.shortLabel(): String = format(shortDate)
+
+          fun Long.stampLabel(): String =
+              Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).format(stamp)
+
+          fun Long.timeLabel(): String =
+              Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).format(clock)
+
+          fun Long.hourOfDay(): Int =
+              Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).hour
+
+          fun Long.minuteOfHour(): Int =
+              Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).minute
+
+          /** Combines a day with a time of day into the instant a block stores. */
+          fun LocalDate.atTimeOfDay(hour: Int, minute: Int): Long =
+              atTime(LocalTime.of(hour.coerceIn(0, 23), minute.coerceIn(0, 59)))
+                  .atZone(ZoneId.systemDefault())
+                  .toInstant()
+                  .toEpochMilli()
+          EOF
+
+          cat > "$PKG/Render.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.buildAnnotatedString
+          import androidx.compose.ui.text.withStyle
+
+          /**
+           * Journal text is plain text. Formatting was removed deliberately, so the only
+           * styling applied here is the search highlight, which is what makes matching
+           * feel alive while you scroll.
+           */
+          object TextRender {
+
+              fun render(
+                  source: String,
+                  highlight: String? = null,
+                  highlightStyle: SpanStyle? = null,
+              ): AnnotatedString = buildAnnotatedString {
+                  if (highlight.isNullOrBlank() || highlightStyle == null) {
+                      append(source)
+                      return@buildAnnotatedString
+                  }
+
+                  var from = 0
+                  while (from < source.length) {
+                      val at = source.indexOf(highlight, from, ignoreCase = true)
+                      if (at < 0) {
+                          append(source.substring(from))
+                          return@buildAnnotatedString
+                      }
+                      if (at > from) append(source.substring(from, at))
+                      val end = (at + highlight.length).coerceAtMost(source.length)
+                      withStyle(highlightStyle) { append(source.substring(at, end)) }
+                      from = end
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/Stats.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import com.example.journal.data.JournalEntry
+          import java.time.LocalDate
+
+          data class JournalStats(
+              val blocks: Int = 0,
+              val daysWritten: Int = 0,
+              val words: Int = 0,
+              val currentStreak: Int = 0,
+              val longestStreak: Int = 0,
+          )
+
+          data class MoodPoint(val date: LocalDate, val average: Double)
+
+          private val whitespace = Regex("\\s+")
+
+          fun countWords(text: String): Int =
+              text.split(whitespace).count { word -> word.any { it.isLetterOrDigit() } }
+
+          fun computeStats(
+              entries: List<JournalEntry>,
+              today: LocalDate = LocalDate.now(),
+          ): JournalStats {
+              if (entries.isEmpty()) return JournalStats()
+
+              val dates = entries.map { it.date }.distinct()
+              val descending = dates.sortedDescending()
+              val ascending = dates.sorted()
+
+              // A streak may start today or yesterday, so writing at 1am doesn't break it.
+              var current = 0
+              val latest = descending.first()
+              if (latest == today || latest == today.minusDays(1)) {
+                  var expected = latest
+                  for (date in descending) {
+                      if (date == expected) {
+                          current++
+                          expected = expected.minusDays(1)
+                      } else if (date.isBefore(expected)) {
+                          break
+                      }
+                  }
+              }
+
+              var longest = 0
+              var run = 0
+              var previousDate: LocalDate? = null
+              for (date in ascending) {
+                  val previous = previousDate
+                  run = if (previous != null && previous.plusDays(1) == date) run + 1 else 1
+                  if (run > longest) longest = run
+                  previousDate = date
+              }
+
+              return JournalStats(
+                  blocks = entries.size,
+                  daysWritten = dates.size,
+                  words = entries.sumOf { countWords(it.text) },
+                  currentStreak = current,
+                  longestStreak = maxOf(longest, current),
+              )
+          }
+
+          /**
+           * Daily average valence over the last [days] days. Locked blocks are excluded
+           * so a hidden entry never shows up as a mood on the chart.
+           */
+          fun computeMoodSeries(
+              entries: List<JournalEntry>,
+              days: Int = 30,
+              today: LocalDate = LocalDate.now(),
+          ): List<MoodPoint> {
+              if (entries.isEmpty()) return emptyList()
+              val from = today.minusDays((days - 1).toLong())
+              return entries
+                  .filter {
+                      !it.locked && it.valence != null &&
+                          !it.date.isBefore(from) && !it.date.isAfter(today)
+                  }
+                  .groupBy { it.date }
+                  .map { (date, dayBlocks) ->
+                      MoodPoint(date, dayBlocks.mapNotNull { it.valence }.average())
+                  }
+                  .sortedBy { it.date }
+          }
+          EOF
+
+          cat > "$PKG/Mood.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import com.example.journal.data.MoodScale
+
+          /**
+           * Five numbered levels plus one free-form slot. Picking a numbered level clears
+           * any custom emoji and the other way round, so a block carries one mood.
+           */
+          @Composable
+          fun MoodChipRow(
+              scale: MoodScale,
+              valence: Int?,
+              customMood: String?,
+              onValence: (Int?) -> Unit,
+              onCustom: () -> Unit,
+          ) {
+              LazyRow(
+                  contentPadding = PaddingValues(horizontal = 12.dp),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  items(scale.levels.size) { index ->
+                      val level = scale.levels[index]
+                      val value = index - MoodScale.OFFSET
+                      FilterChip(
+                          selected = valence == value,
+                          onClick = { onValence(if (valence == value) null else value) },
+                          label = { Text(level.emoji, fontSize = 18.sp) },
+                      )
+                  }
+                  item {
+                      FilterChip(
+                          selected = customMood != null,
+                          onClick = onCustom,
+                          label = { Text(customMood ?: "+", fontSize = 18.sp) },
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun NotebookChipRow(
+              notebooks: List<com.example.journal.data.Notebook>,
+              selectedId: Long,
+              onSelect: (Long) -> Unit,
+              onCreate: () -> Unit,
+          ) {
+              LazyRow(
+                  contentPadding = PaddingValues(horizontal = 12.dp),
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  items(notebooks.size) { index ->
+                      val notebook = notebooks[index]
+                      FilterChip(
+                          selected = selectedId == notebook.id,
+                          onClick = { onSelect(notebook.id) },
+                          label = { Text(notebook.name) },
+                      )
+                  }
+                  item {
+                      FilterChip(
+                          selected = false,
+                          onClick = onCreate,
+                          label = { Text("New") },
+                      )
+                  }
+              }
+          }
+          EOF
+
+          cat > "$PKG/InputDialogs.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TimePicker
+          import androidx.compose.material3.rememberTimePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun TimePickDialog(
+              initialHour: Int,
+              initialMinute: Int,
+              onDismiss: () -> Unit,
+              onConfirm: (hour: Int, minute: Int) -> Unit,
+          ) {
+              val state = rememberTimePickerState(
+                  initialHour = initialHour,
+                  initialMinute = initialMinute,
+                  is24Hour = true,
+              )
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text("Time of this block") },
+                  text = {
+                      Box(modifier = Modifier.fillMaxWidth()) {
+                          TimePicker(state = state)
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(onClick = { onConfirm(state.hour, state.minute) }) { Text("OK") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel") }
+                  },
+              )
+          }
+
+          @Composable
+          fun EmojiDialog(
+              title: String,
+              initial: String,
+              onDismiss: () -> Unit,
+              onConfirm: (String) -> Unit,
+          ) {
+              var value by rememberSaveable { mutableStateOf(initial) }
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = {
+                      Column {
+                          Text(
+                              "Pick any emoji with your keyboard. It is only a skin over a " +
+                                      "number, so you can change it again later and every past " +
+                                      "entry follows.",
+                              style = MaterialTheme.typography.bodySmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                          Spacer(Modifier.height(12.dp))
+                          OutlinedTextField(
+                              value = value,
+                              onValueChange = { value = it },
+                              singleLine = true,
+                              label = { Text("Emoji") },
+                              modifier = Modifier.fillMaxWidth(),
+                          )
+                      }
+                  },
+                  confirmButton = {
+                      TextButton(
+                          enabled = value.isNotBlank(),
+                          onClick = { onConfirm(value.trim()) },
+                      ) { Text("Set") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel") }
+                  },
+              )
+          }
+
+          @Composable
+          fun NameDialog(
+              title: String,
+              initial: String,
+              label: String,
+              onDismiss: () -> Unit,
+              onConfirm: (String) -> Unit,
+          ) {
+              var value by rememberSaveable { mutableStateOf(initial) }
+
+              AlertDialog(
+                  onDismissRequest = onDismiss,
+                  title = { Text(title) },
+                  text = {
+                      OutlinedTextField(
+                          value = value,
+                          onValueChange = { value = it },
+                          singleLine = true,
+                          label = { Text(label) },
+                          modifier = Modifier.fillMaxWidth(),
+                      )
+                  },
+                  confirmButton = {
+                      TextButton(
+                          enabled = value.isNotBlank(),
+                          onClick = { onConfirm(value.trim()) },
+                      ) { Text("Save") }
+                  },
+                  dismissButton = {
+                      TextButton(onClick = onDismiss) { Text("Cancel") }
+                  },
+              )
+          }
+          EOF
+
+      - name: Remove the old markdown renderer
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          rm -f app/src/main/java/com/example/journal/ui/Markdown.kt
+
+      - name: Write the editor
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/TakePictureWithPermission.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.provider.MediaStore
+          import androidx.activity.result.contract.ActivityResultContract
+
+          /**
+           * Like ActivityResultContracts.TakePicture, but it explicitly grants the camera
+           * app read and write access to the FileProvider URI it is handed. Without those
+           * flags the camera cannot open the output file and the capture silently fails.
+           */
+          class TakePictureWithPermission : ActivityResultContract<Uri, Boolean>() {
+
+              override fun createIntent(context: Context, input: Uri): Intent =
+                  Intent(MediaStore.ACTION_IMAGE_CAPTURE)
+                      .putExtra(MediaStore.EXTRA_OUTPUT, input)
+                      .addFlags(
+                          Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                              Intent.FLAG_GRANT_READ_URI_PERMISSION
+                      )
+
+              override fun parseResult(resultCode: Int, intent: Intent?): Boolean =
+                  resultCode == Activity.RESULT_OK
+          }
+          EOF
+
+          cat > "$PKG/EditorScreen.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.net.Uri
+          import androidx.activity.compose.BackHandler
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.imePadding
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.layout.weight
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.DateRange
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.LockOpen
+          import androidx.compose.material.icons.outlined.DeleteOutline
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.DatePicker
+          import androidx.compose.material3.DatePickerDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TextField
+          import androidx.compose.material3.TextFieldDefaults
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.rememberDatePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.focus.FocusRequester
+          import androidx.compose.ui.focus.focusRequester
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.FileProvider
+          import com.example.journal.EditorState
+          import com.example.journal.data.MoodScale
+          import com.example.journal.data.NotebookSet
+          import java.io.File
+          import java.time.LocalDate
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun EditorScreen(
+              state: EditorState,
+              moodScale: MoodScale,
+              notebooks: NotebookSet,
+              placeholder: String,
+              onTextChange: (String) -> Unit,
+              onDateChange: (LocalDate) -> Unit,
+              onTimeChange: (Int, Int) -> Unit,
+              onValenceChange: (Int?) -> Unit,
+              onCustomMoodChange: (String?) -> Unit,
+              onNotebookChange: (Long) -> Unit,
+              onCreateNotebook: (String) -> Unit,
+              onStartNewBlock: () -> Unit,
+              onToggleLock: () -> Unit,
+              onAddPhotoFromUri: (Uri) -> Unit,
+              onAddPhotoFromFile: (File) -> Unit,
+              onRemovePhoto: (String) -> Unit,
+              thumbnailFor: suspend (String) -> ImageBitmap?,
+              fullImageFor: suspend (String) -> ImageBitmap?,
+              onSave: () -> Unit,
+              onDelete: (Long) -> Unit,
+              onClose: () -> Unit,
+          ) {
+              val context = LocalContext.current
+
+              var datePickerOpen by remember { mutableStateOf(false) }
+              var timePickerOpen by remember { mutableStateOf(false) }
+              var moodDialogOpen by remember { mutableStateOf(false) }
+              var notebookDialogOpen by remember { mutableStateOf(false) }
+              var discardDialogOpen by remember { mutableStateOf(false) }
+              var deleteDialogOpen by remember { mutableStateOf(false) }
+              var captureFile by remember { mutableStateOf<File?>(null) }
+
+              val focusRequester = remember { FocusRequester() }
+
+              LaunchedEffect(state.entryId) {
+                  if (state.isNew) runCatching { focusRequester.requestFocus() }
+              }
+
+              val galleryLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.GetContent()
+              ) { uri -> if (uri != null) onAddPhotoFromUri(uri) }
+
+              val cameraLauncher = rememberLauncherForActivityResult(
+                  TakePictureWithPermission()
+              ) { saved ->
+                  val file = captureFile
+                  captureFile = null
+                  if (file != null) {
+                      if (saved) onAddPhotoFromFile(file) else file.delete()
+                  }
+              }
+
+              fun attemptClose() {
+                  if (state.isDirty) discardDialogOpen = true else onClose()
+              }
+
+              BackHandler { attemptClose() }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          navigationIcon = {
+                              IconButton(onClick = { attemptClose() }) {
+                                  Icon(Icons.Default.Close, contentDescription = "Close")
+                              }
+                          },
+                          title = { Text(if (state.isNew) "New block" else "Edit block") },
+                          actions = {
+                              IconButton(onClick = onToggleLock) {
+                                  Icon(
+                                      imageVector = if (state.locked) Icons.Default.Lock
+                                      else Icons.Default.LockOpen,
+                                      contentDescription = if (state.locked)
+                                          "Hidden from the list" else "Visible in the list",
+                                  )
+                              }
+                              if (!state.isNew) {
+                                  IconButton(onClick = { deleteDialogOpen = true }) {
+                                      Icon(
+                                          Icons.Outlined.DeleteOutline,
+                                          contentDescription = "Delete block",
+                                      )
+                                  }
+                              }
+                              TextButton(onClick = onSave, enabled = state.text.isNotBlank()) {
+                                  Text("Save")
+                              }
+                          },
+                      )
+                  },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .imePadding(),
+                  ) {
+                      if (state.canUndoMerge) {
+                          Surface(color = MaterialTheme.colorScheme.secondaryContainer) {
+                              Row(
+                                  modifier = Modifier
+                                      .fillMaxWidth()
+                                      .padding(start = 16.dp, end = 8.dp),
+                                  verticalAlignment = Alignment.CenterVertically,
+                              ) {
+                                  Text(
+                                      text = "Continuing this block",
+                                      style = MaterialTheme.typography.labelMedium,
+                                      modifier = Modifier.weight(1f),
+                                  )
+                                  TextButton(onClick = onStartNewBlock) {
+                                      Text("Start a new one")
+                                  }
+                              }
+                          }
+                      }
+
+                      Row(
+                          modifier = Modifier.fillMaxWidth(),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Row(
+                              modifier = Modifier
+                                  .weight(1f)
+                                  .clickable { datePickerOpen = true }
+                                  .padding(horizontal = 16.dp, vertical = 12.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Icon(
+                                  Icons.Default.DateRange,
+                                  contentDescription = null,
+                                  tint = MaterialTheme.colorScheme.primary,
+                              )
+                              Text(
+                                  text = "  " + state.date.prettyLabel(),
+                                  style = MaterialTheme.typography.bodyMedium,
+                                  color = MaterialTheme.colorScheme.primary,
+                              )
+                          }
+                          Text(
+                              text = state.eventTime.timeLabel(),
+                              style = MaterialTheme.typography.bodyMedium,
+                              color = MaterialTheme.colorScheme.primary,
+                              modifier = Modifier
+                                  .clickable { timePickerOpen = true }
+                                  .padding(horizontal = 16.dp, vertical = 12.dp),
+                          )
+                      }
+
+                      HorizontalDivider()
+
+                      Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                          NotebookChipRow(
+                              notebooks = notebooks.displayOrder,
+                              selectedId = state.notebookId,
+                              onSelect = onNotebookChange,
+                              onCreate = { notebookDialogOpen = true },
+                          )
+                      }
+
+                      HorizontalDivider()
+
+                      Column(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                          MoodChipRow(
+                              scale = moodScale,
+                              valence = state.valence,
+                              customMood = state.customMood,
+                              onValence = onValenceChange,
+                              onCustom = { moodDialogOpen = true },
+                          )
+                      }
+
+                      HorizontalDivider()
+
+                      PhotoStrip(
+                          names = state.attachments,
+                          thumbnailFor = thumbnailFor,
+                          fullImageFor = fullImageFor,
+                          onRemove = onRemovePhoto,
+                          onAddFromGallery = { galleryLauncher.launch("image/*") },
+                          onTakePhoto = {
+                              val directory = File(context.cacheDir, "camera")
+                              directory.mkdirs()
+                              val file = File(directory, "capture-" + System.currentTimeMillis() + ".jpg")
+                              captureFile = file
+                              val uri = FileProvider.getUriForFile(
+                                  context,
+                                  context.packageName + ".fileprovider",
+                                  file,
+                              )
+                              cameraLauncher.launch(uri)
+                          },
+                      )
+
+                      HorizontalDivider()
+
+                      TextField(
+                          value = state.text,
+                          onValueChange = onTextChange,
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .weight(1f)
+                              .focusRequester(focusRequester),
+                          placeholder = {
+                              Text(placeholder.ifBlank { "Write freely. #tag it, add a photo." })
+                          },
+                          colors = TextFieldDefaults.colors(
+                              focusedContainerColor = Color.Transparent,
+                              unfocusedContainerColor = Color.Transparent,
+                              focusedIndicatorColor = Color.Transparent,
+                              unfocusedIndicatorColor = Color.Transparent,
+                          ),
+                      )
+
+                      HorizontalDivider()
+
+                      val footer = buildString {
+                          append(countWords(state.text))
+                          append(" words")
+                          if (state.attachments.isNotEmpty()) {
+                              append("  ·  ")
+                              append(state.attachments.size)
+                              append(if (state.attachments.size == 1) " photo" else " photos")
+                          }
+                          if (state.locked) append("  ·  hidden")
+                          val recorded = state.recordedAt
+                          if (recorded != null) {
+                              append("  ·  recorded ")
+                              append(recorded.stampLabel())
+                              val updated = state.updatedAt
+                              if (updated != null && updated - recorded > 60_000L) {
+                                  append("  ·  edited ")
+                                  append(updated.stampLabel())
+                              }
+                          }
+                      }
+                      Text(
+                          text = footer,
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                      )
+                  }
+              }
+
+              if (datePickerOpen) {
+                  val pickerState = rememberDatePickerState(
+                      initialSelectedDateMillis = state.date.toUtcMillis(),
+                  )
+                  DatePickerDialog(
+                      onDismissRequest = { datePickerOpen = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              datePickerOpen = false
+                              pickerState.selectedDateMillis?.utcToLocalDate()?.let(onDateChange)
+                          }) { Text("OK") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { datePickerOpen = false }) { Text("Cancel") }
+                      },
+                  ) {
+                      DatePicker(state = pickerState)
+                  }
+              }
+
+              if (timePickerOpen) {
+                  TimePickDialog(
+                      initialHour = state.eventTime.hourOfDay(),
+                      initialMinute = state.eventTime.minuteOfHour(),
+                      onDismiss = { timePickerOpen = false },
+                      onConfirm = { hour, minute ->
+                          timePickerOpen = false
+                          onTimeChange(hour, minute)
+                      },
+                  )
+              }
+
+              if (moodDialogOpen) {
+                  EmojiDialog(
+                      title = "Custom mood",
+                      initial = state.customMood ?: "",
+                      onDismiss = { moodDialogOpen = false },
+                      onConfirm = { emoji ->
+                          moodDialogOpen = false
+                          onCustomMoodChange(emoji)
+                      },
+                  )
+              }
+
+              if (notebookDialogOpen) {
+                  NameDialog(
+                      title = "New notebook",
+                      initial = "",
+                      label = "Name",
+                      onDismiss = { notebookDialogOpen = false },
+                      onConfirm = { name ->
+                          notebookDialogOpen = false
+                          onCreateNotebook(name)
+                      },
+                  )
+              }
+
+              if (discardDialogOpen) {
+                  AlertDialog(
+                      onDismissRequest = { discardDialogOpen = false },
+                      title = { Text("Discard changes?") },
+                      text = { Text("Your edits to this block will be lost.") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              discardDialogOpen = false
+                              onClose()
+                          }) { Text("Discard") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { discardDialogOpen = false }) { Text("Keep editing") }
+                      },
+                  )
+              }
+
+              if (deleteDialogOpen) {
+                  AlertDialog(
+                      onDismissRequest = { deleteDialogOpen = false },
+                      title = { Text("Delete this block?") },
+                      text = { Text("This cannot be undone. Its photos go too.") },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              deleteDialogOpen = false
+                              state.entryId?.let(onDelete)
+                          }) { Text("Delete") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { deleteDialogOpen = false }) { Text("Cancel") }
+                      },
+                  )
+              }
+          }
+          EOF
+
+      - name: Write the day list
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/JournalListScreen.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.net.Uri
+          import androidx.compose.foundation.ExperimentalFoundationApi
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.rememberLazyListState
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.CalendarMonth
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.Edit
+          import androidx.compose.material.icons.filled.Lock
+          import androidx.compose.material.icons.filled.MoreVert
+          import androidx.compose.material.icons.filled.Search
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.DatePicker
+          import androidx.compose.material3.DatePickerDialog
+          import androidx.compose.material3.DropdownMenu
+          import androidx.compose.material3.DropdownMenuItem
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.ExtendedFloatingActionButton
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TextField
+          import androidx.compose.material3.TextFieldDefaults
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.material3.rememberDatePickerState
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.SpanStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import com.example.journal.UiMessage
+          import com.example.journal.data.JournalEntry
+          import com.example.journal.data.MoodScale
+          import com.example.journal.data.NotebookSet
+          import kotlinx.coroutines.launch
+          import java.time.LocalDate
+          import kotlin.math.roundToInt
+
+          private const val COLLAPSE_AFTER_DAYS = 7L
+          private const val ALL_NOTEBOOKS = -1L
+
+          data class DayGroup(val date: LocalDate, val blocks: List<JournalEntry>)
+
+          private fun buildDayGroups(entries: List<JournalEntry>): List<DayGroup> =
+              entries.groupBy { it.date }
+                  .entries
+                  .sortedByDescending { it.key }
+                  .map { (date, blocks) ->
+                      DayGroup(
+                          date,
+                          blocks.sortedWith(compareBy({ it.eventTime }, { it.recordedAt })),
+                      )
+                  }
+
+          @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+          @Composable
+          fun JournalListScreen(
+              entries: List<JournalEntry>,
+              notebooks: NotebookSet,
+              stats: JournalStats,
+              moodSeries: List<MoodPoint>,
+              moodScale: MoodScale,
+              onThisDayHits: List<OnThisDayHit>,
+              revealedEntryIds: Set<Long>,
+              revealRecordedTimes: Boolean,
+              collapseOldDays: Boolean,
+              expansion: Map<LocalDate, Boolean>,
+              message: UiMessage?,
+              transferInProgress: Boolean,
+              onMessageShown: () -> Unit,
+              onNewBlock: () -> Unit,
+              onNewBlockForDate: (LocalDate) -> Unit,
+              onOpenEntry: (JournalEntry) -> Unit,
+              onRevealEntry: (Long, String, (Boolean) -> Unit) -> Unit,
+              onToggleDay: (LocalDate, Boolean) -> Unit,
+              onOpenSettings: () -> Unit,
+              onLock: () -> Unit,
+              onExport: (Uri) -> Unit,
+              onImport: (Uri, String) -> Unit,
+          ) {
+              val listState = rememberLazyListState()
+              val scope = rememberCoroutineScope()
+              val snackbarHostState = remember { SnackbarHostState() }
+
+              var query by rememberSaveable { mutableStateOf("") }
+              var searchOpen by rememberSaveable { mutableStateOf(false) }
+              var selectedNotebook by rememberSaveable { mutableStateOf(ALL_NOTEBOOKS) }
+              var menuOpen by remember { mutableStateOf(false) }
+              var pickerOpen by remember { mutableStateOf(false) }
+              var importUri by remember { mutableStateOf<Uri?>(null) }
+              var dateWithNoEntries by remember { mutableStateOf<LocalDate?>(null) }
+              var pendingLockedEntry by remember { mutableStateOf<JournalEntry?>(null) }
+
+              fun requestOpen(entry: JournalEntry) {
+                  if (entry.locked && entry.id !in revealedEntryIds) {
+                      pendingLockedEntry = entry
+                  } else {
+                      onOpenEntry(entry)
+                  }
+              }
+
+              LaunchedEffect(message?.id) {
+                  val current = message ?: return@LaunchedEffect
+                  snackbarHostState.showSnackbar(current.text)
+                  onMessageShown()
+              }
+
+              val importLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri -> if (uri != null) importUri = uri }
+
+              val filtered = remember(entries, query, selectedNotebook) {
+                  entries.asSequence()
+                      .filter { selectedNotebook == ALL_NOTEBOOKS || it.notebookId == selectedNotebook }
+                      .filter {
+                          query.isBlank() ||
+                              it.text.contains(query, ignoreCase = true) ||
+                              it.date.toString().contains(query) ||
+                              it.date.shortLabel().contains(query, ignoreCase = true)
+                      }
+                      .toList()
+              }
+              val dayGroups = remember(filtered) { buildDayGroups(filtered) }
+              val forceExpand = query.isNotBlank() || selectedNotebook != ALL_NOTEBOOKS
+              val today = LocalDate.now()
+              val overviewShown = query.isBlank() && selectedNotebook == ALL_NOTEBOOKS
+
+              Scaffold(
+                  topBar = {
+                      if (searchOpen) {
+                          TopAppBar(
+                              title = {
+                                  TextField(
+                                      value = query,
+                                      onValueChange = { query = it },
+                                      placeholder = { Text("Search blocks") },
+                                      singleLine = true,
+                                      colors = TextFieldDefaults.colors(
+                                          focusedContainerColor = Color.Transparent,
+                                          unfocusedContainerColor = Color.Transparent,
+                                          focusedIndicatorColor = Color.Transparent,
+                                          unfocusedIndicatorColor = Color.Transparent,
+                                      ),
+                                  )
+                              },
+                              navigationIcon = {
+                                  IconButton(onClick = {
+                                      searchOpen = false
+                                      query = ""
+                                  }) { Icon(Icons.Default.Close, contentDescription = "Close search") }
+                              },
+                          )
+                      } else {
+                          TopAppBar(
+                              title = { Text("Journal") },
+                              actions = {
+                                  IconButton(onClick = { searchOpen = true }) {
+                                      Icon(Icons.Default.Search, contentDescription = "Search")
+                                  }
+                                  IconButton(onClick = { pickerOpen = true }) {
+                                      Icon(Icons.Default.CalendarMonth, contentDescription = "Jump to a date")
+                                  }
+                                  Box {
+                                      IconButton(onClick = { menuOpen = true }) {
+                                          Icon(Icons.Default.MoreVert, contentDescription = "More")
+                                      }
+                                      DropdownMenu(
+                                          expanded = menuOpen,
+                                          onDismissRequest = { menuOpen = false },
+                                      ) {
+                                          DropdownMenuItem(
+                                              text = { Text("Settings") },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  onOpenSettings()
+                                              },
+                                          )
+                                          DropdownMenuItem(
+                                              text = { Text("Lock now") },
+                                              onClick = {
+                                                  menuOpen = false
+                                                  onLock()
+                                              },
+                                          )
+                                      }
+                                  }
+                              },
+                          )
+                      }
+                  },
+                  snackbarHost = { SnackbarHost(snackbarHostState) },
+                  floatingActionButton = {
+                      ExtendedFloatingActionButton(
+                          onClick = onNewBlock,
+                          icon = { Icon(Icons.Default.Edit, contentDescription = null) },
+                          text = { Text("New block") },
+                      )
+                  },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding),
+                  ) {
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      ) {
+                          item {
+                              FilterChip(
+                                  selected = selectedNotebook == ALL_NOTEBOOKS,
+                                  onClick = { selectedNotebook = ALL_NOTEBOOKS },
+                                  label = { Text("All") },
+                              )
+                          }
+                          items(notebooks.displayOrder.size) { index ->
+                              val notebook = notebooks.displayOrder[index]
+                              FilterChip(
+                                  selected = selectedNotebook == notebook.id,
+                                  onClick = {
+                                      selectedNotebook =
+                                          if (selectedNotebook == notebook.id) ALL_NOTEBOOKS
+                                          else notebook.id
+                                  },
+                                  label = { Text(notebook.name) },
+                              )
+                          }
+                      }
+
+                      if (transferInProgress) {
+                          LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                      }
+
+                      Box(modifier = Modifier.fillMaxSize()) {
+                          when {
+                              entries.isEmpty() -> EmptyState()
+
+                              dayGroups.isEmpty() -> Box(
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentAlignment = Alignment.Center,
+                              ) {
+                                  Text(
+                                      text = if (query.isNotBlank())
+                                          "No blocks match \"" + query + "\""
+                                      else "Nothing in this notebook yet",
+                                      textAlign = TextAlign.Center,
+                                      modifier = Modifier.padding(24.dp),
+                                  )
+                              }
+
+                              else -> LazyColumn(
+                                  state = listState,
+                                  modifier = Modifier.fillMaxSize(),
+                                  contentPadding = PaddingValues(bottom = 96.dp),
+                              ) {
+                                  if (overviewShown) {
+                                      item(key = "overview") {
+                                          OverviewCard(
+                                              stats = stats,
+                                              moodSeries = moodSeries,
+                                              moodScale = moodScale,
+                                              hits = onThisDayHits,
+                                              revealedEntryIds = revealedEntryIds,
+                                              onRequestOpen = { requestOpen(it) },
+                                          )
+                                      }
+                                  }
+
+                                  items(
+                                      dayGroups.size,
+                                      key = { index -> dayGroups[index].date.toString() },
+                                  ) { index ->
+                                      val group = dayGroups[index]
+                                      val auto = !collapseOldDays ||
+                                          group.date == today ||
+                                          group.date.isAfter(today.minusDays(COLLAPSE_AFTER_DAYS))
+                                      val expanded = expansion[group.date] ?: auto
+
+                                      DayCard(
+                                          group = group,
+                                          expanded = expanded || forceExpand,
+                                          interactive = !forceExpand,
+                                          scale = moodScale,
+                                          revealRecordedTimes = revealRecordedTimes,
+                                          query = query,
+                                          revealedEntryIds = revealedEntryIds,
+                                          showNotebook = selectedNotebook == ALL_NOTEBOOKS,
+                                          notebookName = { notebooks.nameOf(it) },
+                                          onToggle = {
+                                              onToggleDay(group.date, expanded)
+                                          },
+                                          onOpen = { requestOpen(it) },
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if (pickerOpen) {
+                  val pickerState = rememberDatePickerState(
+                      initialSelectedDateMillis = LocalDate.now().toUtcMillis(),
+                  )
+                  DatePickerDialog(
+                      onDismissRequest = { pickerOpen = false },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              pickerOpen = false
+                              val picked = pickerState.selectedDateMillis?.utcToLocalDate()
+                                  ?: return@TextButton
+                              val index = dayGroups.indexOfFirst { it.date == picked }
+                              if (index >= 0) {
+                                  val target = index + if (overviewShown) 1 else 0
+                                  scope.launch { listState.animateScrollToItem(target) }
+                              } else {
+                                  dateWithNoEntries = picked
+                              }
+                          }) { Text("Go") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { pickerOpen = false }) { Text("Cancel") }
+                      },
+                  ) {
+                      DatePicker(state = pickerState)
+                  }
+              }
+
+              dateWithNoEntries?.let { date ->
+                  AlertDialog(
+                      onDismissRequest = { dateWithNoEntries = null },
+                      title = { Text("Nothing written yet") },
+                      text = {
+                          Text(
+                              "There are no blocks for " + date.shortLabel() + ". Would you " +
+                                  "like to write one for that day?"
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              dateWithNoEntries = null
+                              onNewBlockForDate(date)
+                          }) { Text("Write it") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { dateWithNoEntries = null }) { Text("Cancel") }
+                      },
+                  )
+              }
+
+              pendingLockedEntry?.let { entry ->
+                  UnlockEntryDialog(
+                      onDismiss = { pendingLockedEntry = null },
+                      onConfirm = { password, done ->
+                          onRevealEntry(entry.id, password) { ok ->
+                              done(ok)
+                              if (ok) {
+                                  pendingLockedEntry = null
+                                  onOpenEntry(entry)
+                              }
+                          }
+                      },
+                  )
+              }
+
+              importUri?.let { uri ->
+                  ImportPasswordDialog(
+                      onDismiss = { importUri = null },
+                      onConfirm = { password ->
+                          importUri = null
+                          onImport(uri, password)
+                      },
+                  )
+              }
+          }
+
+          @Composable
+          private fun OverviewCard(
+              stats: JournalStats,
+              moodSeries: List<MoodPoint>,
+              moodScale: MoodScale,
+              hits: List<OnThisDayHit>,
+              revealedEntryIds: Set<Long>,
+              onRequestOpen: (JournalEntry) -> Unit,
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 12.dp, vertical = 8.dp),
+              ) {
+                  Card {
+                      Column(modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                          Row(
+                              modifier = Modifier.fillMaxWidth(),
+                              horizontalArrangement = Arrangement.SpaceEvenly,
+                          ) {
+                              StatBlock(stats.currentStreak.toString(), "day streak")
+                              StatBlock(stats.longestStreak.toString(), "best")
+                              StatBlock(stats.blocks.toString(), "blocks")
+                              StatBlock(stats.words.toString(), "words")
+                          }
+
+                          if (moodSeries.isNotEmpty()) {
+                              Spacer(Modifier.height(12.dp))
+                              val average = moodSeries.map { it.average }.average()
+                              val rounded = average.roundToInt().coerceIn(MoodScale.MIN, MoodScale.MAX)
+                              val emoji = moodScale.emojiFor(rounded)
+                              Text(
+                                  text = "Last 30 days · " + (emoji ?: "") + " " +
+                                      "%+.1f".format(average) + " average across " +
+                                      moodSeries.size + " " +
+                                      (if (moodSeries.size == 1) "day" else "days"),
+                                  style = MaterialTheme.typography.labelSmall,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                  modifier = Modifier.fillMaxWidth(),
+                                  textAlign = TextAlign.Center,
+                              )
+                          }
+                      }
+                  }
+
+                  if (hits.isNotEmpty()) {
+                      Spacer(Modifier.height(14.dp))
+                      Text(
+                          text = "On this day",
+                          style = MaterialTheme.typography.titleSmall,
+                          fontWeight = FontWeight.SemiBold,
+                          color = MaterialTheme.colorScheme.primary,
+                      )
+                      hits.forEach { hit ->
+                          val hidden = hit.entry.locked && hit.entry.id !in revealedEntryIds
+                          Card(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .padding(top = 6.dp)
+                                  .clickable { onRequestOpen(hit.entry) },
+                          ) {
+                              Column(modifier = Modifier.padding(12.dp)) {
+                                  Text(
+                                      text = hit.label,
+                                      style = MaterialTheme.typography.labelSmall,
+                                      color = MaterialTheme.colorScheme.primary,
+                                  )
+                                  Spacer(Modifier.height(2.dp))
+                                  if (hidden) {
+                                      Text(
+                                          text = "Hidden block — tap to unlock",
+                                          style = MaterialTheme.typography.bodyMedium,
+                                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                      )
+                                  } else {
+                                      Text(
+                                          text = hit.entry.text,
+                                          style = MaterialTheme.typography.bodyMedium,
+                                          maxLines = 3,
+                                          overflow = TextOverflow.Ellipsis,
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun StatBlock(value: String, label: String) {
+              Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                  Text(
+                      text = value,
+                      style = MaterialTheme.typography.titleMedium,
+                      fontWeight = FontWeight.Bold,
+                  )
+                  Text(
+                      text = label,
+                      style = MaterialTheme.typography.labelSmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+              }
+          }
+
+          @Composable
+          private fun EmptyState() {
+              Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                  Column(
+                      horizontalAlignment = Alignment.CenterHorizontally,
+                      modifier = Modifier.padding(32.dp),
+                  ) {
+                      Text("Nothing here yet", style = MaterialTheme.typography.titleMedium)
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          text = "Tap New block to write your first one. It is stamped with " +
+                              "today's date and the current time.",
+                          style = MaterialTheme.typography.bodyMedium,
+                          textAlign = TextAlign.Center,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun DayCard(
+              group: DayGroup,
+              expanded: Boolean,
+              interactive: Boolean,
+              scale: MoodScale,
+              revealRecordedTimes: Boolean,
+              query: String,
+              revealedEntryIds: Set<Long>,
+              showNotebook: Boolean,
+              notebookName: (Long) -> String?,
+              onToggle: () -> Unit,
+              onOpen: (JournalEntry) -> Unit,
+          ) {
+              val visible = group.blocks.filterNot { it.locked && it.id !in revealedEntryIds }
+              val words = visible.sumOf { countWords(it.text) }
+              val valences = visible.mapNotNull { it.valence }
+              val mood = if (valences.isEmpty()) null
+              else scale.emojiFor(valences.average().roundToInt().coerceIn(MoodScale.MIN, MoodScale.MAX))
+
+              Card(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 12.dp, vertical = 4.dp),
+              ) {
+                  Column(modifier = Modifier.fillMaxWidth()) {
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .clickable(enabled = interactive, onClick = onToggle)
+                              .padding(horizontal = 16.dp, vertical = 12.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          if (interactive) {
+                              Text(
+                                  text = if (expanded) "\u25BE" else "\u25B8",
+                                  style = MaterialTheme.typography.labelMedium,
+                                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              )
+                              Spacer(Modifier.height(0.dp))
+                          }
+                          Text(
+                              text = "  " + group.date.prettyLabel(),
+                              style = MaterialTheme.typography.titleSmall,
+                              fontWeight = FontWeight.SemiBold,
+                              color = MaterialTheme.colorScheme.primary,
+                              modifier = Modifier.weight(1f),
+                          )
+                          if (mood != null) {
+                              Text(text = mood, style = MaterialTheme.typography.titleSmall)
+                          }
+                      }
+
+                      if (visible.isNotEmpty()) {
+                          Text(
+                              text = "  " + visible.size +
+                                  (if (visible.size == 1) " block · " else " blocks · ") +
+                                  words + (if (words == 1) " word" else " words"),
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                              modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
+                          )
+                      }
+
+                      if (expanded) {
+                          visible.forEach { entry ->
+                              BlockSection(
+                                  entry = entry,
+                                  scale = scale,
+                                  revealRecordedTimes = revealRecordedTimes,
+                                  query = query,
+                                  showNotebook = showNotebook,
+                                  notebookLabel = notebookName(entry.notebookId),
+                                  onClick = { onOpen(entry) },
+                              )
+                          }
+                          group.blocks
+                              .filter { it.locked && it.id !in revealedEntryIds }
+                              .forEach { entry ->
+                                  HiddenSection(entry = entry, onClick = { onOpen(entry) })
+                              }
+                          Spacer(Modifier.height(6.dp))
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          private fun BlockSection(
+              entry: JournalEntry,
+              scale: MoodScale,
+              revealRecordedTimes: Boolean,
+              query: String,
+              showNotebook: Boolean,
+              notebookLabel: String?,
+              onClick: () -> Unit,
+          ) {
+              Column(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 16.dp, vertical = 8.dp),
+              ) {
+                  Row(verticalAlignment = Alignment.CenterVertically) {
+                      Text(
+                          text = entry.eventTime.timeLabel(),
+                          style = MaterialTheme.typography.labelMedium,
+                          fontWeight = FontWeight.SemiBold,
+                          color = MaterialTheme.colorScheme.primary,
+                      )
+                      val mood = entry.valence?.let { scale.emojiFor(it) } ?: entry.customMood
+                      if (mood != null) {
+                          Text(text = "  " + mood, style = MaterialTheme.typography.labelMedium)
+                      }
+                      if (showNotebook && notebookLabel != null) {
+                          Text(
+                              text = "  ·  " + notebookLabel,
+                              style = MaterialTheme.typography.labelSmall,
+                              color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          )
+                      }
+                  }
+
+                  Spacer(Modifier.height(4.dp))
+
+                  Text(
+                      text = TextRender.render(
+                          source = entry.text,
+                          highlight = query,
+                          highlightStyle = SpanStyle(
+                              background = MaterialTheme.colorScheme.primaryContainer,
+                              color = MaterialTheme.colorScheme.onPrimaryContainer,
+                              fontWeight = FontWeight.Bold,
+                          ),
+                      ),
+                      style = MaterialTheme.typography.bodyLarge,
+                      maxLines = 12,
+                      overflow = TextOverflow.Ellipsis,
+                  )
+
+                  if (entry.tags.isNotEmpty()) {
+                      Spacer(Modifier.height(6.dp))
+                      Text(
+                          text = entry.tags.joinToString(" ") { "#" + it },
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.primary,
+                      )
+                  }
+
+                  if (entry.attachments.isNotEmpty()) {
+                      Spacer(Modifier.height(4.dp))
+                      Text(
+                          text = entry.attachments.size.toString() +
+                              (if (entry.attachments.size == 1) " photo" else " photos"),
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+
+                  if (revealRecordedTimes) {
+                      Spacer(Modifier.height(4.dp))
+                      val edited = entry.updatedAt - entry.recordedAt > 60_000L
+                      Text(
+                          text = buildString {
+                              append("Recorded ")
+                              append(entry.recordedAt.stampLabel())
+                              if (edited) {
+                                  append(" · edited ")
+                                  append(entry.updatedAt.stampLabel())
+                              }
+                          },
+                          style = MaterialTheme.typography.labelSmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          private fun HiddenSection(entry: JournalEntry, onClick: () -> Unit) {
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .clickable(onClick = onClick)
+                      .padding(horizontal = 16.dp, vertical = 8.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Text(
+                      text = entry.eventTime.timeLabel(),
+                      style = MaterialTheme.typography.labelMedium,
+                      fontWeight = FontWeight.SemiBold,
+                      color = MaterialTheme.colorScheme.primary,
+                  )
+                  Icon(
+                      Icons.Default.Lock,
+                      contentDescription = null,
+                      tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                      modifier = Modifier.padding(start = 8.dp).height(14.dp),
+                  )
+                  Text(
+                      text = "  Hidden block — tap to unlock",
+                      style = MaterialTheme.typography.bodyMedium,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  )
+              }
+          }
+          EOF
+
+      - name: Write settings screen and root
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          PKG=app/src/main/java/com/example/journal/ui
+
+          cat > "$PKG/SettingsScreen.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import android.Manifest
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.width
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.ArrowBack
+          import androidx.compose.material3.AlertDialog
+          import androidx.compose.material3.ExperimentalMaterial3Api
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.HorizontalDivider
+          import androidx.compose.material3.Icon
+          import androidx.compose.material3.IconButton
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Scaffold
+          import androidx.compose.material3.SnackbarHost
+          import androidx.compose.material3.SnackbarHostState
+          import androidx.compose.material3.Switch
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.TextButton
+          import androidx.compose.material3.TopAppBar
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import com.example.journal.ReminderSettings
+          import com.example.journal.UiMessage
+          import com.example.journal.data.MoodScale
+          import com.example.journal.data.Notebook
+          import com.example.journal.data.NotebookSet
+          import java.time.LocalDate
+
+          private val AUTO_LOCK_OPTIONS = listOf(
+              0L to "Immediately",
+              30_000L to "30 seconds",
+              120_000L to "2 minutes",
+              300_000L to "5 minutes",
+              -1L to "Never",
+          )
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun SettingsScreen(
+              notebooks: NotebookSet,
+              moodScale: MoodScale,
+              placeholder: String,
+              defaultNotebookId: Long,
+              autoLockMillis: Long,
+              collapseOldDays: Boolean,
+              revealRecordedTimes: Boolean,
+              reminder: ReminderSettings,
+              transferInProgress: Boolean,
+              message: UiMessage?,
+              onMessageShown: () -> Unit,
+              onBack: () -> Unit,
+              onMoodEmoji: (Int, String) -> Unit,
+              onMoodLabel: (Int, String) -> Unit,
+              onResetMoodScale: () -> Unit,
+              onPlaceholderChange: (String) -> Unit,
+              onDefaultNotebookChange: (Long) -> Unit,
+              onAutoLockChange: (Long) -> Unit,
+              onCollapseChange: (Boolean) -> Unit,
+              onRevealChange: (Boolean) -> Unit,
+              onReminderChange: (Boolean, Int, Int) -> Unit,
+              onCreateNotebook: (String) -> Unit,
+              onRenameNotebook: (Long, String) -> Unit,
+              onToggleNotebookPin: (Long) -> Unit,
+              onDeleteNotebook: (Long) -> Unit,
+              onChangePassword: (String, String, (String?) -> Unit) -> Unit,
+              onExport: (Uri) -> Unit,
+              onImport: (Uri, String) -> Unit,
+              onLockNow: () -> Unit,
+          ) {
+              val context = LocalContext.current
+              val snackbarHostState = remember { SnackbarHostState() }
+
+              var moodDialogIndex by remember { mutableStateOf<Int?>(null) }
+              var notebookDialogOpen by remember { mutableStateOf(false) }
+              var renameTarget by remember { mutableStateOf<Notebook?>(null) }
+              var deleteTarget by remember { mutableStateOf<Notebook?>(null) }
+              var reminderOpen by remember { mutableStateOf(false) }
+              var changePasswordOpen by remember { mutableStateOf(false) }
+              var importUri by remember { mutableStateOf<Uri?>(null) }
+              var blockedDialog by remember { mutableStateOf(false) }
+              var placeholderDraft by rememberSaveable { mutableStateOf(placeholder) }
+
+              LaunchedEffect(message?.id) {
+                  val current = message ?: return@LaunchedEffect
+                  snackbarHostState.showSnackbar(current.text)
+                  onMessageShown()
+              }
+
+              val notificationPermission = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { granted -> if (!granted) blockedDialog = true }
+
+              val exportLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.CreateDocument("application/json")
+              ) { uri -> uri?.let(onExport) }
+
+              val importLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument()
+              ) { uri -> if (uri != null) importUri = uri }
+
+              Scaffold(
+                  topBar = {
+                      TopAppBar(
+                          navigationIcon = {
+                              IconButton(onClick = onBack) {
+                                  Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                              }
+                          },
+                          title = { Text("Settings") },
+                      )
+                  },
+                  snackbarHost = { SnackbarHost(snackbarHostState) },
+              ) { padding ->
+                  Column(
+                      modifier = Modifier
+                          .fillMaxSize()
+                          .padding(padding)
+                          .verticalScroll(rememberScrollState()),
+                  ) {
+                      if (transferInProgress) {
+                          LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                      }
+
+                      SectionTitle("Mood scale")
+                      Text(
+                          text = "Each level is a number under the surface. Change an emoji or " +
+                              "a label and every block you have ever written follows, because " +
+                              "only the number is stored.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp),
+                      )
+                      Spacer(Modifier.height(12.dp))
+
+                      moodScale.levels.forEachIndexed { index, level ->
+                          Row(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .padding(horizontal = 16.dp, vertical = 4.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Text(
+                                  text = level.emoji,
+                                  fontSize = 24.sp,
+                                  modifier = Modifier
+                                      .clickable { moodDialogIndex = index }
+                                      .padding(end = 12.dp),
+                              )
+                              OutlinedTextField(
+                                  value = level.label,
+                                  onValueChange = { onMoodLabel(index, it) },
+                                  singleLine = true,
+                                  label = { Text("Label") },
+                                  modifier = Modifier.weight(1f),
+                              )
+                          }
+                      }
+
+                      Spacer(Modifier.height(8.dp))
+                      TextButton(
+                          onClick = onResetMoodScale,
+                          modifier = Modifier.padding(horizontal = 8.dp),
+                      ) { Text("Reset to defaults") }
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("Notebooks")
+                      notebooks.displayOrder.forEach { notebook ->
+                          Row(
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .padding(horizontal = 16.dp, vertical = 4.dp),
+                              verticalAlignment = Alignment.CenterVertically,
+                          ) {
+                              Text(
+                                  text = notebook.name,
+                                  style = MaterialTheme.typography.bodyLarge,
+                                  modifier = Modifier
+                                      .weight(1f)
+                                      .clickable { renameTarget = notebook },
+                              )
+                              FilterChip(
+                                  selected = notebook.pinned,
+                                  onClick = { onToggleNotebookPin(notebook.id) },
+                                  label = { Text("Pinned") },
+                              )
+                              Spacer(Modifier.width(8.dp))
+                              TextButton(onClick = { deleteTarget = notebook }) { Text("Delete") }
+                          }
+                      }
+                      TextButton(
+                          onClick = { notebookDialogOpen = true },
+                          modifier = Modifier.padding(horizontal = 8.dp),
+                      ) { Text("New notebook") }
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("Writing")
+                      OutlinedTextField(
+                          value = placeholderDraft,
+                          onValueChange = {
+                              placeholderDraft = it
+                              onPlaceholderChange(it)
+                          },
+                          label = { Text("Prompt shown in an empty block") },
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(horizontal = 16.dp),
+                      )
+                      Spacer(Modifier.height(12.dp))
+                      Text(
+                          text = "New blocks land in this notebook unless you change it",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp),
+                      )
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      ) {
+                          items(notebooks.displayOrder.size) { index ->
+                              val notebook = notebooks.displayOrder[index]
+                              FilterChip(
+                                  selected = defaultNotebookId == notebook.id,
+                                  onClick = { onDefaultNotebookChange(notebook.id) },
+                                  label = { Text(notebook.name) },
+                              )
+                          }
+                      }
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("Privacy")
+                      Text(
+                          text = "Lock the journal after it has been in the background for",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp),
+                      )
+                      LazyRow(
+                          contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                      ) {
+                          items(AUTO_LOCK_OPTIONS.size) { index ->
+                              val (value, label) = AUTO_LOCK_OPTIONS[index]
+                              val selected = when (value) {
+                                  0L, 30_000L, 120_000L, 300_000L -> autoLockMillis == value
+                                  else -> autoLockMillis <= 0L
+                              }
+                              FilterChip(
+                                  selected = selected,
+                                  onClick = { onAutoLockChange(value) },
+                                  label = { Text(label) },
+                              )
+                          }
+                      }
+                      Row(modifier = Modifier.padding(horizontal = 8.dp)) {
+                          TextButton(onClick = { changePasswordOpen = true }) {
+                              Text("Change password")
+                          }
+                          TextButton(onClick = onLockNow) { Text("Lock now") }
+                      }
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("List")
+                      ToggleRow("Collapse days older than a week", collapseOldDays, onCollapseChange)
+                      ToggleRow("Show recorded times", revealRecordedTimes, onRevealChange)
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("Reminder")
+                      Row(
+                          modifier = Modifier
+                              .fillMaxWidth()
+                              .padding(horizontal = 16.dp, vertical = 4.dp),
+                          verticalAlignment = Alignment.CenterVertically,
+                      ) {
+                          Text(
+                              text = if (reminder.enabled)
+                                  "Every day at " + "%02d:%02d".format(reminder.hour, reminder.minute)
+                              else "Off",
+                              style = MaterialTheme.typography.bodyLarge,
+                              modifier = Modifier.weight(1f),
+                          )
+                          TextButton(onClick = { reminderOpen = true }) { Text("Change") }
+                      }
+
+                      HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+
+                      SectionTitle("Data")
+                      Row(modifier = Modifier.padding(horizontal = 8.dp)) {
+                          TextButton(
+                              enabled = !transferInProgress,
+                              onClick = {
+                                  exportLauncher.launch("journal-backup-" + LocalDate.now() + ".json")
+                              },
+                          ) { Text("Export") }
+                          TextButton(
+                              enabled = !transferInProgress,
+                              onClick = { importLauncher.launch(arrayOf("*/*")) },
+                          ) { Text("Import") }
+                      }
+                      Text(
+                          text = "Exports are encrypted with the password in force when you " +
+                              "make them. Keep that password with the file.",
+                          style = MaterialTheme.typography.bodySmall,
+                          color = MaterialTheme.colorScheme.onSurfaceVariant,
+                          modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                      )
+
+                      Spacer(Modifier.height(40.dp))
+                  }
+              }
+
+              moodDialogIndex?.let { index ->
+                  EmojiDialog(
+                      title = "Level " + (index - MoodScale.OFFSET),
+                      initial = moodScale.levels.getOrNull(index)?.emoji ?: "",
+                      onDismiss = { moodDialogIndex = null },
+                      onConfirm = { emoji ->
+                          moodDialogIndex = null
+                          onMoodEmoji(index, emoji)
+                      },
+                  )
+              }
+
+              if (notebookDialogOpen) {
+                  NameDialog(
+                      title = "New notebook",
+                      initial = "",
+                      label = "Name",
+                      onDismiss = { notebookDialogOpen = false },
+                      onConfirm = { name ->
+                          notebookDialogOpen = false
+                          onCreateNotebook(name)
+                      },
+                  )
+              }
+
+              renameTarget?.let { notebook ->
+                  NameDialog(
+                      title = "Rename notebook",
+                      initial = notebook.name,
+                      label = "Name",
+                      onDismiss = { renameTarget = null },
+                      onConfirm = { name ->
+                          renameTarget = null
+                          onRenameNotebook(notebook.id, name)
+                      },
+                  )
+              }
+
+              deleteTarget?.let { notebook ->
+                  AlertDialog(
+                      onDismissRequest = { deleteTarget = null },
+                      title = { Text("Delete \"" + notebook.name + "\"?") },
+                      text = {
+                          Text(
+                              "Blocks in this notebook are moved to your other notebooks, " +
+                                  "not deleted."
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              deleteTarget = null
+                              onDeleteNotebook(notebook.id)
+                          }) { Text("Delete") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = { deleteTarget = null }) { Text("Cancel") }
+                      },
+                  )
+              }
+
+              if (reminderOpen) {
+                  ReminderDialog(
+                      initial = reminder,
+                      onDismiss = { reminderOpen = false },
+                      onSave = { enabled, hour, minute ->
+                          reminderOpen = false
+                          val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                              ContextCompat.checkSelfPermission(
+                                  context,
+                                  Manifest.permission.POST_NOTIFICATIONS,
+                              ) != PackageManager.PERMISSION_GRANTED
+                          if (enabled && needsPermission) {
+                              notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                          }
+                          onReminderChange(enabled, hour, minute)
+                      },
+                  )
+              }
+
+              importUri?.let { uri ->
+                  ImportPasswordDialog(
+                      onDismiss = { importUri = null },
+                      onConfirm = { password ->
+                          importUri = null
+                          onImport(uri, password)
+                      },
+                  )
+              }
+
+              if (blockedDialog) {
+                  AlertDialog(
+                      onDismissRequest = { blockedDialog = false },
+                      title = { Text("Notifications are off") },
+                      text = {
+                          Text(
+                              "Android is blocking notifications for this app, so the reminder " +
+                                  "will not appear. You can turn them back on in Settings, Apps, " +
+                                  "Journal, Notifications."
+                          )
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { blockedDialog = false }) { Text("OK") }
+                      },
+                  )
+              }
+
+              if (changePasswordOpen) {
+                  ChangePasswordDialog(
+                      onDismiss = { changePasswordOpen = false },
+                      onSubmit = onChangePassword,
+                  )
+              }
+          }
+
+          @Composable
+          private fun SectionTitle(text: String) {
+              Text(
+                  text = text,
+                  style = MaterialTheme.typography.titleSmall,
+                  color = MaterialTheme.colorScheme.primary,
+                  modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 6.dp),
+              )
+          }
+
+          @Composable
+          private fun ToggleRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+              Row(
+                  modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 16.dp, vertical = 4.dp),
+                  verticalAlignment = Alignment.CenterVertically,
+              ) {
+                  Text(
+                      text = label,
+                      style = MaterialTheme.typography.bodyLarge,
+                      modifier = Modifier.weight(1f),
+                  )
+                  Switch(checked = checked, onCheckedChange = onChange)
+              }
+          }
+          EOF
+
+          cat > "$PKG/JournalRoot.kt" <<'EOF'
+          package com.example.journal.ui
+
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.lifecycle.compose.collectAsStateWithLifecycle
+          import com.example.journal.JournalViewModel
+          import com.example.journal.LockState
+
+          @Composable
+          fun JournalRoot(viewModel: JournalViewModel) {
+
+              val lockState by viewModel.lockState.collectAsStateWithLifecycle()
+              val entries by viewModel.entries.collectAsStateWithLifecycle()
+              val notebooks by viewModel.notebooks.collectAsStateWithLifecycle()
+              val moodScale by viewModel.moodScale.collectAsStateWithLifecycle()
+              val stats by viewModel.stats.collectAsStateWithLifecycle()
+              val moodSeries by viewModel.moodSeries.collectAsStateWithLifecycle()
+              val onThisDay by viewModel.onThisDay.collectAsStateWithLifecycle()
+              val editor by viewModel.editor.collectAsStateWithLifecycle()
+              val authError by viewModel.authError.collectAsStateWithLifecycle()
+              val authBusy by viewModel.authBusy.collectAsStateWithLifecycle()
+              val reveal by viewModel.revealRecordedTimes.collectAsStateWithLifecycle()
+              val collapse by viewModel.collapseOldDays.collectAsStateWithLifecycle()
+              val expansion by viewModel.expansion.collectAsStateWithLifecycle()
+              val revealedEntries by viewModel.revealedEntries.collectAsStateWithLifecycle()
+              val placeholder by viewModel.placeholder.collectAsStateWithLifecycle()
+              val defaultNotebook by viewModel.defaultNotebookId.collectAsStateWithLifecycle()
+              val autoLock by viewModel.autoLockMillis.collectAsStateWithLifecycle()
+              val reminder by viewModel.reminder.collectAsStateWithLifecycle()
+              val message by viewModel.message.collectAsStateWithLifecycle()
+              val transfer by viewModel.transferInProgress.collectAsStateWithLifecycle()
+
+              var settingsOpen by rememberSaveable { mutableStateOf(false) }
+
+              when (lockState) {
+                  LockState.NeedsSetup -> SetupPasswordScreen(
+                      error = authError,
+                      busy = authBusy,
+                      onSetup = viewModel::setupPassword,
+                  )
+
+                  LockState.Locked -> UnlockScreen(
+                      error = authError,
+                      busy = authBusy,
+                      onUnlock = viewModel::unlock,
+                  )
+
+                  LockState.Unlocked -> {
+                      val open = editor
+                      when {
+                          open != null -> EditorScreen(
+                              state = open,
+                              moodScale = moodScale,
+                              notebooks = notebooks,
+                              placeholder = placeholder,
+                              onTextChange = viewModel::updateText,
+                              onDateChange = viewModel::setDate,
+                              onTimeChange = viewModel::setTime,
+                              onValenceChange = viewModel::setValence,
+                              onCustomMoodChange = viewModel::setCustomMood,
+                              onNotebookChange = viewModel::setDraftNotebook,
+                              onCreateNotebook = { viewModel.createNotebook(it, select = true) },
+                              onStartNewBlock = viewModel::startNewBlock,
+                              onToggleLock = viewModel::toggleDraftLock,
+                              onAddPhotoFromUri = viewModel::addPhotoFromUri,
+                              onAddPhotoFromFile = viewModel::addPhotoFromFile,
+                              onRemovePhoto = viewModel::removePhoto,
+                              thumbnailFor = viewModel::thumbnailFor,
+                              fullImageFor = viewModel::fullImageFor,
+                              onSave = viewModel::saveDraft,
+                              onDelete = viewModel::deleteEntry,
+                              onClose = viewModel::closeEditor,
+                          )
+
+                          settingsOpen -> SettingsScreen(
+                              notebooks = notebooks,
+                              moodScale = moodScale,
+                              placeholder = placeholder,
+                              defaultNotebookId = defaultNotebook,
+                              autoLockMillis = autoLock,
+                              collapseOldDays = collapse,
+                              revealRecordedTimes = reveal,
+                              reminder = reminder,
+                              transferInProgress = transfer,
+                              message = message,
+                              onMessageShown = viewModel::clearMessage,
+                              onBack = { settingsOpen = false },
+                              onMoodEmoji = viewModel::setMoodEmoji,
+                              onMoodLabel = viewModel::setMoodLabel,
+                              onResetMoodScale = viewModel::resetMoodScale,
+                              onPlaceholderChange = viewModel::setPlaceholder,
+                              onDefaultNotebookChange = viewModel::setDefaultNotebook,
+                              onAutoLockChange = viewModel::setAutoLock,
+                              onCollapseChange = viewModel::setCollapseOldDays,
+                              onRevealChange = viewModel::setRevealRecordedTimes,
+                              onReminderChange = viewModel::setReminder,
+                              onCreateNotebook = { viewModel.createNotebook(it, select = false) },
+                              onRenameNotebook = viewModel::renameNotebook,
+                              onToggleNotebookPin = viewModel::toggleNotebookPin,
+                              onDeleteNotebook = viewModel::deleteNotebook,
+                              onChangePassword = viewModel::changePassword,
+                              onExport = viewModel::exportTo,
+                              onImport = viewModel::importFrom,
+                              onLockNow = viewModel::lock,
+                          )
+
+                          else -> JournalListScreen(
+                              entries = entries,
+                              notebooks = notebooks,
+                              stats = stats,
+                              moodSeries = moodSeries,
+                              moodScale = moodScale,
+                              onThisDayHits = onThisDay,
+                              revealedEntryIds = revealedEntries,
+                              revealRecordedTimes = reveal,
+                              collapseOldDays = collapse,
+                              expansion = expansion,
+                              message = message,
+                              transferInProgress = transfer,
+                              onMessageShown = viewModel::clearMessage,
+                              onNewBlock = { viewModel.openNewEntry() },
+                              onNewBlockForDate = { viewModel.openNewEntry(it, null) },
+                              onOpenEntry = viewModel::openEntry,
+                              onRevealEntry = viewModel::revealEntry,
+                              onToggleDay = viewModel::toggleDay,
+                              onOpenSettings = { settingsOpen = true },
+                              onLock = viewModel::lock,
+                              onExport = viewModel::exportTo,
+                              onImport = viewModel::importFrom,
+                          )
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Mark this phase as applied
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          printf 'Phase 1 has been applied. Delete this file only if you want it regenerated.\n' > .phase-1-applied
+
+      - name: Commit the changes
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "journal-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Phase 1: day blocks, notebooks, valence moods, settings"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up the Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "SDK root: $SDK"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | sort | tail -n 1)"
+          echo "sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          printf 'sdk.dir=%s\n' "$SDK" > local.properties
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build the debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publish the APK as a release download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view apk-latest > /dev/null 2>&1 || \
+            gh release create apk-latest \
+              --title "Latest build" \
+              --notes "Built automatically from the newest commit. Download app-debug.apk below."
+          gh release upload apk-latest app/build/outputs/apk/debug/app-debug.apk --clobber
