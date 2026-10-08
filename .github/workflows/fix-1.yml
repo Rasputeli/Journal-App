@@ -1,0 +1,118 @@
+name: Fix 1
+
+on:
+  push:
+    branches: [ "**" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether this fix already ran
+        id: check
+        run: |
+          if [ -f .fix-1-applied ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply the five patches
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          set -e
+
+          VM=app/src/main/java/com/example/journal/JournalViewModel.kt
+          ED=app/src/main/java/com/example/journal/ui/EditorScreen.kt
+          LS=app/src/main/java/com/example/journal/ui/JournalListScreen.kt
+          WG=app/src/main/java/com/example/journal/widget/JournalWidget.kt
+
+          # 1. JournalViewModel: local date -> instant needs atTimeOfDay
+          if grep -q 'import com\.example\.journal\.ui\.atTimeOfDay' "$VM"; then
+            echo "1. atTimeOfDay import already present"
+          else
+            sed -i 's|^import com\.example\.journal\.ui\.JournalStats$|import com.example.journal.ui.JournalStats\nimport com.example.journal.ui.atTimeOfDay|' "$VM"
+            echo "1. added atTimeOfDay import"
+          fi
+
+          # 2. EditorScreen: weight is a scope member, never a top-level import
+          sed -i '/^import androidx\.compose\.foundation\.layout\.weight$/d' "$ED"
+          grep -c 'import androidx\.compose\.foundation\.layout\.weight' "$ED" || true
+          echo "2. removed bogus weight import"
+
+          # 3. JournalListScreen: file picker needs its imports
+          if grep -q 'androidx\.activity\.compose\.rememberLauncherForActivityResult' "$LS"; then
+            echo "3. activity result imports already present"
+          else
+            sed -i 's|^import android\.net\.Uri$|import android.net.Uri\nimport androidx.activity.compose.rememberLauncherForActivityResult\nimport androidx.activity.result.contract.ActivityResultContracts|' "$LS"
+            echo "3. added activity result imports"
+          fi
+
+          # 4. Remove the duplicate class the first attempt left behind
+          rm -f app/src/main/java/com/example/journal/ui/TakePictureContract.kt
+          echo "4. removed duplicate TakePictureContract.kt"
+          grep -rl 'class TakePictureWithPermission' app/src/main/java || true
+
+          # 5. JournalWidget: JournalStats field was renamed to blocks
+          sed -i 's|stats\.entries|stats.blocks|g' "$WG"
+          echo "5. renamed stats.entries to stats.blocks"
+
+          printf 'Fix 1 has been applied. Delete this file only to reapply the patches.\n' > .fix-1-applied
+
+      - name: Commit the patches
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "journal-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Fix 1: missing imports, duplicate contract, renamed stats field"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up the Android SDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | sort | tail -n 1)"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          printf 'sdk.dir=%s\n' "$SDK" > local.properties
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build the debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: journal-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publish the APK as a release download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view apk-latest > /dev/null 2>&1 || \
+            gh release create apk-latest \
+              --title "Latest build" \
+              --notes "Built automatically from the newest commit. Download app-debug.apk below."
+          gh release upload apk-latest app/build/outputs/apk/debug/app-debug.apk --clobber
