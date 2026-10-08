@@ -25,7 +25,7 @@ object JournalWidget {
     fun push(context: Context, stats: JournalStats) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putInt(KEY_STREAK, stats.currentStreak)
-            .putInt(KEY_ENTRIES, stats.entries)
+            .putInt(KEY_ENTRIES, stats.blocks)
             .putInt(KEY_WORDS, stats.words)
             .apply()
         refreshAll(context)

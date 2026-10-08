@@ -16,6 +16,7 @@ import com.example.journal.data.Notebook
 import com.example.journal.data.NotebookSet
 import com.example.journal.data.SettingsStore
 import com.example.journal.ui.JournalStats
+import com.example.journal.ui.atTimeOfDay
 import com.example.journal.ui.MoodPoint
 import com.example.journal.ui.OnThisDayHit
 import com.example.journal.ui.computeMoodSeries
