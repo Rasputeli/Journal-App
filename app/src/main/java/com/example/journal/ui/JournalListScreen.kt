@@ -1,11 +1,6 @@
 package com.example.journal.ui
 
-import android.Manifest
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -62,85 +57,71 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.core.content.ContextCompat
-import com.example.journal.ReminderSettings
 import com.example.journal.UiMessage
 import com.example.journal.data.JournalEntry
+import com.example.journal.data.MoodScale
+import com.example.journal.data.NotebookSet
 import kotlinx.coroutines.launch
 import java.time.LocalDate
+import kotlin.math.roundToInt
 
-private sealed interface ListItem {
-    data class DateHeader(val date: LocalDate, val count: Int) : ListItem
-    data class EntryRow(val entry: JournalEntry) : ListItem
-}
+private const val COLLAPSE_AFTER_DAYS = 7L
+private const val ALL_NOTEBOOKS = -1L
 
-private fun buildListItems(entries: List<JournalEntry>): List<ListItem> {
-    val items = mutableListOf<ListItem>()
-    var currentDate: LocalDate? = null
-    var bucket = mutableListOf<JournalEntry>()
+data class DayGroup(val date: LocalDate, val blocks: List<JournalEntry>)
 
-    fun flush() {
-        val date = currentDate ?: return
-        items += ListItem.DateHeader(date, bucket.size)
-        bucket.forEach { items += ListItem.EntryRow(it) }
-        bucket = mutableListOf()
-    }
-
-    entries.forEach { entry ->
-        if (entry.date != currentDate) {
-            flush()
-            currentDate = entry.date
+private fun buildDayGroups(entries: List<JournalEntry>): List<DayGroup> =
+    entries.groupBy { it.date }
+        .entries
+        .sortedByDescending { it.key }
+        .map { (date, blocks) ->
+            DayGroup(
+                date,
+                blocks.sortedWith(compareBy({ it.eventTime }, { it.recordedAt })),
+            )
         }
-        bucket += entry
-    }
-    flush()
-    return items
-}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun JournalListScreen(
     entries: List<JournalEntry>,
+    notebooks: NotebookSet,
     stats: JournalStats,
+    moodSeries: List<MoodPoint>,
+    moodScale: MoodScale,
     onThisDayHits: List<OnThisDayHit>,
     revealedEntryIds: Set<Long>,
     revealRecordedTimes: Boolean,
-    reminder: ReminderSettings,
-    transferInProgress: Boolean,
+    collapseOldDays: Boolean,
+    expansion: Map<LocalDate, Boolean>,
     message: UiMessage?,
+    transferInProgress: Boolean,
     onMessageShown: () -> Unit,
-    onToggleRevealRecordedTimes: () -> Unit,
-    onNewEntry: () -> Unit,
-    onNewEntryForDate: (LocalDate) -> Unit,
+    onNewBlock: () -> Unit,
+    onNewBlockForDate: (LocalDate) -> Unit,
     onOpenEntry: (JournalEntry) -> Unit,
     onRevealEntry: (Long, String, (Boolean) -> Unit) -> Unit,
+    onToggleDay: (LocalDate, Boolean) -> Unit,
+    onOpenSettings: () -> Unit,
     onLock: () -> Unit,
-    onChangePassword: (String, String, (String?) -> Unit) -> Unit,
-    onSaveReminder: (Boolean, Int, Int) -> Unit,
     onExport: (Uri) -> Unit,
     onImport: (Uri, String) -> Unit,
 ) {
-    val context = LocalContext.current
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
 
     var query by rememberSaveable { mutableStateOf("") }
     var searchOpen by rememberSaveable { mutableStateOf(false) }
-    var activeTag by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedNotebook by rememberSaveable { mutableStateOf(ALL_NOTEBOOKS) }
     var menuOpen by remember { mutableStateOf(false) }
     var pickerOpen by remember { mutableStateOf(false) }
-    var reminderOpen by remember { mutableStateOf(false) }
-    var changePasswordOpen by remember { mutableStateOf(false) }
     var importUri by remember { mutableStateOf<Uri?>(null) }
-    var notificationsBlockedDialog by remember { mutableStateOf(false) }
     var dateWithNoEntries by remember { mutableStateOf<LocalDate?>(null) }
     var pendingLockedEntry by remember { mutableStateOf<JournalEntry?>(null) }
 
@@ -158,39 +139,25 @@ fun JournalListScreen(
         onMessageShown()
     }
 
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> if (!granted) notificationsBlockedDialog = true }
-
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("application/json")
-    ) { uri -> uri?.let(onExport) }
-
     val importLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri -> if (uri != null) importUri = uri }
 
-    val allTags = remember(entries) {
-        entries.flatMap { it.tags }
-            .groupingBy { it }
-            .eachCount()
-            .entries
-            .sortedByDescending { it.value }
-            .map { it.key }
-    }
-
-    val filtered = remember(entries, query, activeTag) {
+    val filtered = remember(entries, query, selectedNotebook) {
         entries.asSequence()
-            .filter { activeTag == null || activeTag in it.tags }
+            .filter { selectedNotebook == ALL_NOTEBOOKS || it.notebookId == selectedNotebook }
             .filter {
                 query.isBlank() ||
-                        it.text.contains(query, ignoreCase = true) ||
-                        it.date.toString().contains(query) ||
-                        it.date.shortLabel().contains(query, ignoreCase = true)
+                    it.text.contains(query, ignoreCase = true) ||
+                    it.date.toString().contains(query) ||
+                    it.date.shortLabel().contains(query, ignoreCase = true)
             }
             .toList()
     }
-    val listItems = remember(filtered) { buildListItems(filtered) }
+    val dayGroups = remember(filtered) { buildDayGroups(filtered) }
+    val forceExpand = query.isNotBlank() || selectedNotebook != ALL_NOTEBOOKS
+    val today = LocalDate.now()
+    val overviewShown = query.isBlank() && selectedNotebook == ALL_NOTEBOOKS
 
     Scaffold(
         topBar = {
@@ -200,7 +167,7 @@ fun JournalListScreen(
                         TextField(
                             value = query,
                             onValueChange = { query = it },
-                            placeholder = { Text("Search entries") },
+                            placeholder = { Text("Search blocks") },
                             singleLine = true,
                             colors = TextFieldDefaults.colors(
                                 focusedContainerColor = Color.Transparent,
@@ -236,51 +203,10 @@ fun JournalListScreen(
                                 onDismissRequest = { menuOpen = false },
                             ) {
                                 DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (revealRecordedTimes) "Hide recorded times"
-                                            else "Show recorded times"
-                                        )
-                                    },
+                                    text = { Text("Settings") },
                                     onClick = {
                                         menuOpen = false
-                                        onToggleRevealRecordedTimes()
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            if (reminder.enabled)
-                                                "Daily reminder · %02d:%02d".format(reminder.hour, reminder.minute)
-                                            else "Daily reminder"
-                                        )
-                                    },
-                                    onClick = {
-                                        menuOpen = false
-                                        reminderOpen = true
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Export journal") },
-                                    enabled = !transferInProgress,
-                                    onClick = {
-                                        menuOpen = false
-                                        exportLauncher.launch("journal-backup-${LocalDate.now()}.json")
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Import journal") },
-                                    enabled = !transferInProgress,
-                                    onClick = {
-                                        menuOpen = false
-                                        importLauncher.launch(arrayOf("*/*"))
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text("Change password") },
-                                    onClick = {
-                                        menuOpen = false
-                                        changePasswordOpen = true
+                                        onOpenSettings()
                                     },
                                 )
                                 DropdownMenuItem(
@@ -299,9 +225,9 @@ fun JournalListScreen(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             ExtendedFloatingActionButton(
-                onClick = onNewEntry,
+                onClick = onNewBlock,
                 icon = { Icon(Icons.Default.Edit, contentDescription = null) },
-                text = { Text("New entry") },
+                text = { Text("New block") },
             )
         },
     ) { padding ->
@@ -310,12 +236,29 @@ fun JournalListScreen(
                 .fillMaxSize()
                 .padding(padding),
         ) {
-            if (allTags.isNotEmpty()) {
-                TagFilterRow(
-                    tags = allTags,
-                    activeTag = activeTag,
-                    onSelect = { activeTag = it },
-                )
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                item {
+                    FilterChip(
+                        selected = selectedNotebook == ALL_NOTEBOOKS,
+                        onClick = { selectedNotebook = ALL_NOTEBOOKS },
+                        label = { Text("All") },
+                    )
+                }
+                items(notebooks.displayOrder.size) { index ->
+                    val notebook = notebooks.displayOrder[index]
+                    FilterChip(
+                        selected = selectedNotebook == notebook.id,
+                        onClick = {
+                            selectedNotebook =
+                                if (selectedNotebook == notebook.id) ALL_NOTEBOOKS
+                                else notebook.id
+                        },
+                        label = { Text(notebook.name) },
+                    )
+                }
             }
 
             if (transferInProgress) {
@@ -326,17 +269,14 @@ fun JournalListScreen(
                 when {
                     entries.isEmpty() -> EmptyState()
 
-                    listItems.isEmpty() -> Box(
+                    dayGroups.isEmpty() -> Box(
                         modifier = Modifier.fillMaxSize(),
                         contentAlignment = Alignment.Center,
                     ) {
                         Text(
-                            text = when {
-                                activeTag != null && query.isNotBlank() ->
-                                    "Nothing tagged #$activeTag matches \"$query\""
-                                activeTag != null -> "Nothing tagged #$activeTag yet"
-                                else -> "No entries match \"$query\""
-                            },
+                            text = if (query.isNotBlank())
+                                "No blocks match \"" + query + "\""
+                            else "Nothing in this notebook yet",
                             textAlign = TextAlign.Center,
                             modifier = Modifier.padding(24.dp),
                         )
@@ -347,38 +287,44 @@ fun JournalListScreen(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 96.dp),
                     ) {
-                        if (query.isBlank() && activeTag == null) {
+                        if (overviewShown) {
                             item(key = "overview") {
                                 OverviewCard(
                                     stats = stats,
+                                    moodSeries = moodSeries,
+                                    moodScale = moodScale,
                                     hits = onThisDayHits,
                                     revealedEntryIds = revealedEntryIds,
-                                    onRequestOpen = ::requestOpen,
+                                    onRequestOpen = { requestOpen(it) },
                                 )
                             }
                         }
 
-                        listItems.forEach { listItem ->
-                            when (listItem) {
-                                is ListItem.DateHeader -> stickyHeader(
-                                    key = "header-${listItem.date}"
-                                ) {
-                                    DateHeaderRow(listItem.date, listItem.count)
-                                }
+                        items(
+                            dayGroups.size,
+                            key = { index -> dayGroups[index].date.toString() },
+                        ) { index ->
+                            val group = dayGroups[index]
+                            val auto = !collapseOldDays ||
+                                group.date == today ||
+                                group.date.isAfter(today.minusDays(COLLAPSE_AFTER_DAYS))
+                            val expanded = expansion[group.date] ?: auto
 
-                                is ListItem.EntryRow -> item(
-                                    key = "entry-${listItem.entry.id}"
-                                ) {
-                                    EntryCard(
-                                        entry = listItem.entry,
-                                        hidden = listItem.entry.locked &&
-                                                listItem.entry.id !in revealedEntryIds,
-                                        query = query,
-                                        revealRecordedTimes = revealRecordedTimes,
-                                        onClick = { requestOpen(listItem.entry) },
-                                    )
-                                }
-                            }
+                            DayCard(
+                                group = group,
+                                expanded = expanded || forceExpand,
+                                interactive = !forceExpand,
+                                scale = moodScale,
+                                revealRecordedTimes = revealRecordedTimes,
+                                query = query,
+                                revealedEntryIds = revealedEntryIds,
+                                showNotebook = selectedNotebook == ALL_NOTEBOOKS,
+                                notebookName = { notebooks.nameOf(it) },
+                                onToggle = {
+                                    onToggleDay(group.date, expanded)
+                                },
+                                onOpen = { requestOpen(it) },
+                            )
                         }
                     }
                 }
@@ -397,11 +343,10 @@ fun JournalListScreen(
                     pickerOpen = false
                     val picked = pickerState.selectedDateMillis?.utcToLocalDate()
                         ?: return@TextButton
-                    val index = listItems.indexOfFirst {
-                        it is ListItem.DateHeader && it.date == picked
-                    }
+                    val index = dayGroups.indexOfFirst { it.date == picked }
                     if (index >= 0) {
-                        scope.launch { listState.animateScrollToItem(index) }
+                        val target = index + if (overviewShown) 1 else 0
+                        scope.launch { listState.animateScrollToItem(target) }
                     } else {
                         dateWithNoEntries = picked
                     }
@@ -421,14 +366,14 @@ fun JournalListScreen(
             title = { Text("Nothing written yet") },
             text = {
                 Text(
-                    "There are no entries for ${date.shortLabel()}. " +
-                            "Would you like to write one for that day?"
+                    "There are no blocks for " + date.shortLabel() + ". Would you " +
+                        "like to write one for that day?"
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     dateWithNoEntries = null
-                    onNewEntryForDate(date)
+                    onNewBlockForDate(date)
                 }) { Text("Write it") }
             },
             dismissButton = {
@@ -452,25 +397,6 @@ fun JournalListScreen(
         )
     }
 
-    if (reminderOpen) {
-        ReminderDialog(
-            initial = reminder,
-            onDismiss = { reminderOpen = false },
-            onSave = { enabled, hour, minute ->
-                reminderOpen = false
-                val needsPermission = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                        ContextCompat.checkSelfPermission(
-                            context,
-                            Manifest.permission.POST_NOTIFICATIONS,
-                        ) != PackageManager.PERMISSION_GRANTED
-                if (enabled && needsPermission) {
-                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                }
-                onSaveReminder(enabled, hour, minute)
-            },
-        )
-    }
-
     importUri?.let { uri ->
         ImportPasswordDialog(
             onDismiss = { importUri = null },
@@ -480,63 +406,13 @@ fun JournalListScreen(
             },
         )
     }
-
-    if (notificationsBlockedDialog) {
-        AlertDialog(
-            onDismissRequest = { notificationsBlockedDialog = false },
-            title = { Text("Notifications are off") },
-            text = {
-                Text(
-                    "Android is blocking notifications for this app, so the reminder " +
-                            "won't appear. You can turn them back on in Settings, Apps, " +
-                            "Journal, Notifications."
-                )
-            },
-            confirmButton = {
-                TextButton(onClick = { notificationsBlockedDialog = false }) { Text("OK") }
-            },
-        )
-    }
-
-    if (changePasswordOpen) {
-        ChangePasswordDialog(
-            onDismiss = { changePasswordOpen = false },
-            onSubmit = onChangePassword,
-        )
-    }
-}
-
-@Composable
-private fun TagFilterRow(
-    tags: List<String>,
-    activeTag: String?,
-    onSelect: (String?) -> Unit,
-) {
-    LazyRow(
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        item {
-            FilterChip(
-                selected = activeTag == null,
-                onClick = { onSelect(null) },
-                label = { Text("All") },
-            )
-        }
-        items(tags.size) { index ->
-            val tag = tags[index]
-            FilterChip(
-                selected = activeTag == tag,
-                onClick = { onSelect(if (activeTag == tag) null else tag) },
-                label = { Text("#$tag") },
-            )
-        }
-    }
 }
 
 @Composable
 private fun OverviewCard(
     stats: JournalStats,
+    moodSeries: List<MoodPoint>,
+    moodScale: MoodScale,
     hits: List<OnThisDayHit>,
     revealedEntryIds: Set<Long>,
     onRequestOpen: (JournalEntry) -> Unit,
@@ -547,16 +423,33 @@ private fun OverviewCard(
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
         Card {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 16.dp, horizontal = 8.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-            ) {
-                StatBlock(stats.currentStreak.toString(), "day streak")
-                StatBlock(stats.longestStreak.toString(), "best")
-                StatBlock(stats.entries.toString(), "entries")
-                StatBlock(stats.words.toString(), "words")
+            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                ) {
+                    StatBlock(stats.currentStreak.toString(), "day streak")
+                    StatBlock(stats.longestStreak.toString(), "best")
+                    StatBlock(stats.blocks.toString(), "blocks")
+                    StatBlock(stats.words.toString(), "words")
+                }
+
+                if (moodSeries.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    val average = moodSeries.map { it.average }.average()
+                    val rounded = average.roundToInt().coerceIn(MoodScale.MIN, MoodScale.MAX)
+                    val emoji = moodScale.emojiFor(rounded)
+                    Text(
+                        text = "Last 30 days · " + (emoji ?: "") + " " +
+                            "%+.1f".format(average) + " average across " +
+                            moodSeries.size + " " +
+                            (if (moodSeries.size == 1) "day" else "days"),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
 
@@ -585,13 +478,13 @@ private fun OverviewCard(
                         Spacer(Modifier.height(2.dp))
                         if (hidden) {
                             Text(
-                                text = "Hidden entry — tap to unlock",
+                                text = "Hidden block — tap to unlock",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         } else {
                             Text(
-                                text = MarkdownLite.render(hit.entry.text),
+                                text = hit.entry.text,
                                 style = MaterialTheme.typography.bodyMedium,
                                 maxLines = 3,
                                 overflow = TextOverflow.Ellipsis,
@@ -630,8 +523,8 @@ private fun EmptyState() {
             Text("Nothing here yet", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(6.dp))
             Text(
-                "Tap New entry to write your first one. It will be stamped with " +
-                        "today's date and the current time.",
+                text = "Tap New block to write your first one. It is stamped with " +
+                    "today's date and the current time.",
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -641,116 +534,208 @@ private fun EmptyState() {
 }
 
 @Composable
-private fun DateHeaderRow(date: LocalDate, count: Int) {
-    Surface(
-        color = MaterialTheme.colorScheme.surface,
-        modifier = Modifier.fillMaxWidth(),
+private fun DayCard(
+    group: DayGroup,
+    expanded: Boolean,
+    interactive: Boolean,
+    scale: MoodScale,
+    revealRecordedTimes: Boolean,
+    query: String,
+    revealedEntryIds: Set<Long>,
+    showNotebook: Boolean,
+    notebookName: (Long) -> String?,
+    onToggle: () -> Unit,
+    onOpen: (JournalEntry) -> Unit,
+) {
+    val visible = group.blocks.filterNot { it.locked && it.id !in revealedEntryIds }
+    val words = visible.sumOf { countWords(it.text) }
+    val valences = visible.mapNotNull { it.valence }
+    val mood = if (valences.isEmpty()) null
+    else scale.emojiFor(valences.average().roundToInt().coerceIn(MoodScale.MIN, MoodScale.MAX))
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Text(
-                text = date.prettyLabel(),
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.primary,
-            )
-            if (count > 1) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(enabled = interactive, onClick = onToggle)
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (interactive) {
+                    Text(
+                        text = if (expanded) "\u25BE" else "\u25B8",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(0.dp))
+                }
                 Text(
-                    text = "$count entries",
+                    text = "  " + group.date.prettyLabel(),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                if (mood != null) {
+                    Text(text = mood, style = MaterialTheme.typography.titleSmall)
+                }
+            }
+
+            if (visible.isNotEmpty()) {
+                Text(
+                    text = "  " + visible.size +
+                        (if (visible.size == 1) " block · " else " blocks · ") +
+                        words + (if (words == 1) " word" else " words"),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
                 )
+            }
+
+            if (expanded) {
+                visible.forEach { entry ->
+                    BlockSection(
+                        entry = entry,
+                        scale = scale,
+                        revealRecordedTimes = revealRecordedTimes,
+                        query = query,
+                        showNotebook = showNotebook,
+                        notebookLabel = notebookName(entry.notebookId),
+                        onClick = { onOpen(entry) },
+                    )
+                }
+                group.blocks
+                    .filter { it.locked && it.id !in revealedEntryIds }
+                    .forEach { entry ->
+                        HiddenSection(entry = entry, onClick = { onOpen(entry) })
+                    }
+                Spacer(Modifier.height(6.dp))
             }
         }
     }
 }
 
 @Composable
-private fun EntryCard(
+private fun BlockSection(
     entry: JournalEntry,
-    hidden: Boolean,
-    query: String,
+    scale: MoodScale,
     revealRecordedTimes: Boolean,
+    query: String,
+    showNotebook: Boolean,
+    notebookLabel: String?,
     onClick: () -> Unit,
 ) {
-    Card(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            if (hidden) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        Icons.Default.Lock,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.height(16.dp),
-                    )
-                    Spacer(Modifier.height(0.dp))
-                    Text(
-                        text = "  Hidden entry — tap to unlock",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-            } else {
-                if (entry.mood != null) {
-                    Text(text = entry.mood, fontSize = 22.sp)
-                    Spacer(Modifier.height(4.dp))
-                }
-
-                Text(
-                    text = if (entry.text.isBlank()) {
-                        androidx.compose.ui.text.AnnotatedString("(empty)")
-                    } else {
-                        MarkdownLite.render(
-                            source = entry.text,
-                            highlight = query,
-                            highlightStyle = SpanStyle(
-                                background = MaterialTheme.colorScheme.primaryContainer,
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                fontWeight = FontWeight.Bold,
-                            ),
-                        )
-                    },
-                    style = MaterialTheme.typography.bodyLarge,
-                    maxLines = 5,
-                    overflow = TextOverflow.Ellipsis,
-                )
-
-                if (entry.tags.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = entry.tags.joinToString(" ") { "#$it" },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = entry.eventTime.timeLabel(),
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            val mood = entry.valence?.let { scale.emojiFor(it) } ?: entry.customMood
+            if (mood != null) {
+                Text(text = "  " + mood, style = MaterialTheme.typography.labelMedium)
             }
-
-            if (revealRecordedTimes) {
-                Spacer(Modifier.height(8.dp))
-                val edited = entry.updatedAt - entry.createdAt > 60_000L
+            if (showNotebook && notebookLabel != null) {
                 Text(
-                    text = buildString {
-                        append("Recorded ${entry.createdAt.stampLabel()}")
-                        if (edited) append(" · edited ${entry.updatedAt.stampLabel()}")
-                        if (entry.attachments.isNotEmpty()) {
-                            append(" · ${entry.attachments.size} photo")
-                            if (entry.attachments.size > 1) append("s")
-                        }
-                    },
+                    text = "  ·  " + notebookLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
+
+        Spacer(Modifier.height(4.dp))
+
+        Text(
+            text = TextRender.render(
+                source = entry.text,
+                highlight = query,
+                highlightStyle = SpanStyle(
+                    background = MaterialTheme.colorScheme.primaryContainer,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    fontWeight = FontWeight.Bold,
+                ),
+            ),
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 12,
+            overflow = TextOverflow.Ellipsis,
+        )
+
+        if (entry.tags.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = entry.tags.joinToString(" ") { "#" + it },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+
+        if (entry.attachments.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = entry.attachments.size.toString() +
+                    (if (entry.attachments.size == 1) " photo" else " photos"),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        if (revealRecordedTimes) {
+            Spacer(Modifier.height(4.dp))
+            val edited = entry.updatedAt - entry.recordedAt > 60_000L
+            Text(
+                text = buildString {
+                    append("Recorded ")
+                    append(entry.recordedAt.stampLabel())
+                    if (edited) {
+                        append(" · edited ")
+                        append(entry.updatedAt.stampLabel())
+                    }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun HiddenSection(entry: JournalEntry, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = entry.eventTime.timeLabel(),
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Icon(
+            Icons.Default.Lock,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 8.dp).height(14.dp),
+        )
+        Text(
+            text = "  Hidden block — tap to unlock",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }

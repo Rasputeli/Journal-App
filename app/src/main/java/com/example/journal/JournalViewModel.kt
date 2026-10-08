@@ -10,12 +10,21 @@ import com.example.journal.data.AuthManager
 import com.example.journal.data.EntryRepository
 import com.example.journal.data.ImageCompressor
 import com.example.journal.data.JournalEntry
+import com.example.journal.data.MoodScale
+import com.example.journal.data.MoodScaleStore
+import com.example.journal.data.Notebook
+import com.example.journal.data.NotebookSet
 import com.example.journal.data.SettingsStore
 import com.example.journal.ui.JournalStats
+import com.example.journal.ui.MoodPoint
 import com.example.journal.ui.OnThisDayHit
+import com.example.journal.ui.computeMoodSeries
 import com.example.journal.ui.computeOnThisDay
 import com.example.journal.ui.computeStats
 import com.example.journal.ui.decodeSampled
+import com.example.journal.ui.hourOfDay
+import com.example.journal.ui.minuteOfHour
+import com.example.journal.ui.timeLabel
 import com.example.journal.widget.JournalWidget
 import com.example.journal.work.ReminderScheduler
 import kotlinx.coroutines.Dispatchers
@@ -43,31 +52,45 @@ sealed interface LockState {
 }
 
 /**
- * The entry open in the editor. It lives here rather than in the composable
- * so a background auto-lock never throws away unsaved text.
+ * The block open in the editor. It lives here rather than in the composable so
+ * a background auto-lock never throws away unsaved text.
  */
 data class EditorState(
     val entryId: Long?,
     val originalText: String,
     val originalDate: LocalDate,
-    val originalMood: String?,
+    val originalEventTime: Long,
+    val originalValence: Int?,
+    val originalCustomMood: String?,
+    val originalNotebookId: Long,
     val originalLocked: Boolean,
     val originalAttachments: List<String>,
     val text: String,
     val date: LocalDate,
-    val mood: String?,
+    val eventTime: Long,
+    val valence: Int?,
+    val customMood: String?,
+    val notebookId: Long,
     val locked: Boolean,
     val attachments: List<String>,
-    val createdAt: Long? = null,
+    val merged: Boolean = false,
+    val recordedAt: Long? = null,
     val updatedAt: Long? = null,
 ) {
     val isNew: Boolean get() = entryId == null
+
     val isDirty: Boolean
         get() = text != originalText ||
                 date != originalDate ||
-                mood != originalMood ||
+                eventTime != originalEventTime ||
+                valence != originalValence ||
+                customMood != originalCustomMood ||
+                notebookId != originalNotebookId ||
                 locked != originalLocked ||
                 attachments != originalAttachments
+
+    /** True while the merge banner can still be dismissed without losing typing. */
+    val canUndoMerge: Boolean get() = merged && text == originalText
 }
 
 data class ReminderSettings(val enabled: Boolean, val hour: Int, val minute: Int)
@@ -81,6 +104,8 @@ class JournalViewModel(
     private val settings: SettingsStore,
     private val appContext: Context,
 ) : ViewModel() {
+
+    private val moodScaleStore = MoodScaleStore(appContext)
 
     private val _lockState = MutableStateFlow<LockState>(
         if (auth.hasPassword) LockState.Locked else LockState.NeedsSetup
@@ -99,8 +124,30 @@ class JournalViewModel(
     private val _revealedEntries = MutableStateFlow<Set<Long>>(emptySet())
     val revealedEntries: StateFlow<Set<Long>> = _revealedEntries.asStateFlow()
 
+    /** User overrides for day collapsing. Cleared whenever the journal locks. */
+    private val _expansion = MutableStateFlow<Map<LocalDate, Boolean>>(emptyMap())
+    val expansion: StateFlow<Map<LocalDate, Boolean>> = _expansion.asStateFlow()
+
+    private val _notebooks = MutableStateFlow(NotebookSet.DEFAULT)
+    val notebooks: StateFlow<NotebookSet> = _notebooks.asStateFlow()
+
+    private val _moodScale = MutableStateFlow(moodScaleStore.load())
+    val moodScale: StateFlow<MoodScale> = _moodScale.asStateFlow()
+
     private val _revealRecordedTimes = MutableStateFlow(settings.revealRecordedTimes)
     val revealRecordedTimes: StateFlow<Boolean> = _revealRecordedTimes.asStateFlow()
+
+    private val _collapseOldDays = MutableStateFlow(settings.collapseOldDays)
+    val collapseOldDays: StateFlow<Boolean> = _collapseOldDays.asStateFlow()
+
+    private val _autoLockMillis = MutableStateFlow(settings.autoLockMillis)
+    val autoLockMillis: StateFlow<Long> = _autoLockMillis.asStateFlow()
+
+    private val _placeholder = MutableStateFlow(settings.placeholder)
+    val placeholder: StateFlow<String> = _placeholder.asStateFlow()
+
+    private val _defaultNotebookId = MutableStateFlow(settings.defaultNotebookId)
+    val defaultNotebookId: StateFlow<Long> = _defaultNotebookId.asStateFlow()
 
     private val _reminder = MutableStateFlow(
         ReminderSettings(settings.reminderEnabled, settings.reminderHour, settings.reminderMinute)
@@ -116,21 +163,22 @@ class JournalViewModel(
     private var pendingLock: Job? = null
     private var pendingNewEntry = false
 
-    /** Small decoded thumbnails, most recently used last so they can evict. */
-    private val thumbnails = object : LinkedHashMap<String, ImageBitmap>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ImageBitmap>?) =
-            size > 64
-    }
+    private val thumbnails = HashMap<String, ImageBitmap>()
 
     val entries: StateFlow<List<JournalEntry>> = _lockState
         .flatMapLatest { state ->
-            if (state == LockState.Unlocked) repository.observeEntries() else flowOf(emptyList())
+            if (state == LockState.Unlocked) repository.observeEntries()
+            else flowOf(emptyList())
         }
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val stats: StateFlow<JournalStats> = entries
         .map { computeStats(it) }
         .stateIn(viewModelScope, SharingStarted.Eagerly, JournalStats())
+
+    val moodSeries: StateFlow<List<MoodPoint>> = entries
+        .map { computeMoodSeries(it, 30, LocalDate.now()) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     val onThisDay: StateFlow<List<OnThisDayHit>> = entries
         .map { computeOnThisDay(it, LocalDate.now()) }
@@ -139,18 +187,19 @@ class JournalViewModel(
     init {
         viewModelScope.launch {
             stats.collect { current ->
-                if (_lockState.value == LockState.Unlocked && current.entries > 0) {
+                if (_lockState.value == LockState.Unlocked && current.blocks > 0) {
                     JournalWidget.push(appContext, current)
                 }
             }
         }
     }
 
-    // ------------------------------------------------------------ locking
+    // --------------------------------------------------------------- locking
 
     fun setupPassword(password: String, confirm: String) {
         val error = when {
-            password.length < MIN_PASSWORD_LENGTH -> "Use at least $MIN_PASSWORD_LENGTH characters."
+            password.length < MIN_PASSWORD_LENGTH ->
+                "Use at least " + MIN_PASSWORD_LENGTH + " characters."
             password != confirm -> "Those passwords don't match."
             else -> null
         }
@@ -190,7 +239,6 @@ class JournalViewModel(
         }
     }
 
-    /** Cheap re-check used by the per-entry lock. Does not change lock state. */
     fun revealEntry(entryId: Long, password: String, onResult: (Boolean) -> Unit) {
         viewModelScope.launch {
             val ok = withContext(Dispatchers.Default) {
@@ -206,7 +254,12 @@ class JournalViewModel(
             pendingNewEntry = false
             openNewEntry()
         }
-        viewModelScope.launch { repository.cleanUpAttachments() }
+        viewModelScope.launch {
+            val set = repository.notebooks()
+            _notebooks.value = set
+            repository.saveNotebooks(set)
+            repository.cleanUpAttachments()
+        }
     }
 
     fun requestNewEntry() {
@@ -219,12 +272,15 @@ class JournalViewModel(
         pendingLock = null
         auth.lock()
         _revealedEntries.value = emptySet()
+        _expansion.value = emptyMap()
         thumbnails.clear()
         _lockState.value = LockState.Locked
     }
 
-    fun scheduleLock(delayMillis: Long = AUTO_LOCK_DELAY_MILLIS) {
+    fun scheduleLock() {
         if (_lockState.value != LockState.Unlocked) return
+        val delayMillis = _autoLockMillis.value
+        if (delayMillis <= 0L) return
         pendingLock?.cancel()
         pendingLock = viewModelScope.launch {
             delay(delayMillis)
@@ -237,51 +293,124 @@ class JournalViewModel(
         pendingLock = null
     }
 
-    // ------------------------------------------------------------- editor
+    fun toggleDay(date: LocalDate, currentlyExpanded: Boolean) {
+        _expansion.update { it + (date to !currentlyExpanded) }
+    }
 
-    fun openNewEntry(date: LocalDate = LocalDate.now()) {
+    // ---------------------------------------------------------------- editor
+
+    fun openNewEntry() = openNewEntry(LocalDate.now(), null)
+
+    fun openNewEntry(date: LocalDate, notebookId: Long?) =
+        beginNewBlock(date, notebookId, forceNew = false)
+
+    private fun beginNewBlock(date: LocalDate, notebookId: Long?, forceNew: Boolean) {
+        val target = notebookId ?: resolvedDefaultNotebookId()
+
+        if (!forceNew && date == LocalDate.now()) {
+            val now = System.currentTimeMillis()
+            val recent = entries.value
+                .filter { it.date == date && !it.locked && it.notebookId == target }
+                .maxByOrNull { it.updatedAt }
+            if (recent != null && now - recent.updatedAt <= MERGE_WINDOW_MILLIS) {
+                post("Continuing your " + recent.eventTime.timeLabel() + " block.")
+                openExisting(recent, merged = true)
+                return
+            }
+        }
+
+        val eventTime = date.atTimeOfDay(
+            System.currentTimeMillis().hourOfDay(),
+            System.currentTimeMillis().minuteOfHour(),
+        )
         _editor.value = EditorState(
             entryId = null,
             originalText = "",
             originalDate = date,
-            originalMood = null,
+            originalEventTime = eventTime,
+            originalValence = null,
+            originalCustomMood = null,
+            originalNotebookId = target,
             originalLocked = false,
             originalAttachments = emptyList(),
             text = "",
             date = date,
-            mood = null,
+            eventTime = eventTime,
+            valence = null,
+            customMood = null,
+            notebookId = target,
             locked = false,
             attachments = emptyList(),
         )
     }
 
-    fun openEntry(entry: JournalEntry) {
+    /** Abandons a merge and starts a genuinely new block instead. */
+    fun startNewBlock() {
+        val current = _editor.value ?: return
+        if (!current.canUndoMerge) return
+        beginNewBlock(current.date, current.notebookId, forceNew = true)
+    }
+
+    fun openEntry(entry: JournalEntry) = openExisting(entry, merged = false)
+
+    private fun openExisting(entry: JournalEntry, merged: Boolean) {
         _editor.value = EditorState(
             entryId = entry.id,
             originalText = entry.text,
             originalDate = entry.date,
-            originalMood = entry.mood,
+            originalEventTime = entry.eventTime,
+            originalValence = entry.valence,
+            originalCustomMood = entry.customMood,
+            originalNotebookId = entry.notebookId,
             originalLocked = entry.locked,
             originalAttachments = entry.attachments,
             text = entry.text,
             date = entry.date,
-            mood = entry.mood,
+            eventTime = entry.eventTime,
+            valence = entry.valence,
+            customMood = entry.customMood,
+            notebookId = entry.notebookId,
             locked = entry.locked,
             attachments = entry.attachments,
-            createdAt = entry.createdAt,
+            merged = merged,
+            recordedAt = entry.recordedAt,
             updatedAt = entry.updatedAt,
         )
     }
 
-    fun updateDraft(text: String? = null, date: LocalDate? = null) {
+    fun updateText(text: String) {
+        _editor.update { it?.copy(text = text) }
+    }
+
+    fun setDate(date: LocalDate) {
         _editor.update { current ->
             if (current == null) null
-            else current.copy(text = text ?: current.text, date = date ?: current.date)
+            else current.copy(
+                date = date,
+                eventTime = date.atTimeOfDay(
+                    current.eventTime.hourOfDay(),
+                    current.eventTime.minuteOfHour(),
+                ),
+            )
         }
     }
 
-    fun setMood(mood: String?) {
-        _editor.update { it?.copy(mood = mood) }
+    fun setTime(hour: Int, minute: Int) {
+        _editor.update { current ->
+            current?.copy(eventTime = current.date.atTimeOfDay(hour, minute))
+        }
+    }
+
+    fun setValence(valence: Int?) {
+        _editor.update { it?.copy(valence = valence, customMood = null) }
+    }
+
+    fun setCustomMood(emoji: String?) {
+        _editor.update { it?.copy(customMood = emoji, valence = null) }
+    }
+
+    fun setDraftNotebook(notebookId: Long) {
+        _editor.update { it?.copy(notebookId = notebookId) }
     }
 
     fun toggleDraftLock() {
@@ -303,8 +432,11 @@ class JournalViewModel(
             repository.save(
                 id = draft.entryId,
                 date = draft.date,
+                eventTime = draft.eventTime,
                 text = draft.text.trim(),
-                mood = draft.mood,
+                valence = draft.valence,
+                customMood = draft.customMood,
+                notebookId = draft.notebookId,
                 locked = draft.locked,
                 attachmentNames = draft.attachments,
             )
@@ -319,7 +451,7 @@ class JournalViewModel(
         }
     }
 
-    // --------------------------------------------------------------- photos
+    // ---------------------------------------------------------------- photos
 
     fun addPhotoFromUri(uri: Uri) {
         ingestPhoto {
@@ -342,19 +474,21 @@ class JournalViewModel(
     private fun ingestPhoto(loader: suspend () -> ByteArray?) {
         if (_editor.value == null) return
         viewModelScope.launch {
-            val raw = loader() ?: run {
-                postMessage("That picture could not be read.")
+            val raw = loader()
+            if (raw == null) {
+                post("That picture could not be read.")
                 return@launch
             }
             val compressed = withContext(Dispatchers.Default) {
                 ImageCompressor.fromBytes(raw)
-            } ?: run {
-                postMessage("That file doesn't look like a picture.")
+            }
+            if (compressed == null) {
+                post("That file doesn't look like a picture.")
                 return@launch
             }
             val name = repository.addAttachment(compressed)
             if (name == null) {
-                postMessage("Could not save the picture.")
+                post("Could not save the picture.")
                 return@launch
             }
             _editor.update { it?.copy(attachments = it.attachments + name) }
@@ -365,7 +499,10 @@ class JournalViewModel(
         thumbnails[name]?.let { return it }
         val bytes = repository.loadAttachment(name) ?: return null
         val bitmap = withContext(Dispatchers.Default) { decodeSampled(bytes, 220) }
-        if (bitmap != null) thumbnails[name] = bitmap
+        if (bitmap != null) {
+            if (thumbnails.size > 64) thumbnails.clear()
+            thumbnails[name] = bitmap
+        }
         return bitmap
     }
 
@@ -374,12 +511,139 @@ class JournalViewModel(
         return withContext(Dispatchers.Default) { decodeSampled(bytes, 2048) }
     }
 
-    // ------------------------------------------------------------- settings
+    // ------------------------------------------------------------- notebooks
 
-    fun toggleRevealRecordedTimes() {
-        val next = !_revealRecordedTimes.value
-        _revealRecordedTimes.value = next
-        settings.revealRecordedTimes = next
+    private fun resolvedDefaultNotebookId(): Long {
+        val set = _notebooks.value
+        val configured = _defaultNotebookId.value
+        return if (set.byId(configured) != null) configured
+        else set.firstId ?: NotebookSet.DEFAULT_ID
+    }
+
+    fun createNotebook(name: String, select: Boolean = false) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val current = _notebooks.value
+            if (current.notebooks.any { it.name.equals(trimmed, ignoreCase = true) }) {
+                post("You already have a notebook called \"" + trimmed + "\".")
+                return@launch
+            }
+            val nextId = (current.notebooks.maxOfOrNull { it.id } ?: 0L) + 1L
+            val updated = NotebookSet(
+                current.notebooks +
+                    Notebook(nextId, trimmed, pinned = false, order = current.notebooks.size)
+            )
+            repository.saveNotebooks(updated)
+            _notebooks.value = updated
+            if (select) _editor.update { it?.copy(notebookId = nextId) }
+        }
+    }
+
+    fun renameNotebook(id: Long, name: String) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val current = _notebooks.value
+            if (current.notebooks.any {
+                    it.id != id && it.name.equals(trimmed, ignoreCase = true)
+                }
+            ) {
+                post("Another notebook is already called \"" + trimmed + "\".")
+                return@launch
+            }
+            val updated = NotebookSet(
+                current.notebooks.map {
+                    if (it.id == id) it.copy(name = trimmed) else it
+                }
+            )
+            repository.saveNotebooks(updated)
+            _notebooks.value = updated
+        }
+    }
+
+    fun toggleNotebookPin(id: Long) {
+        viewModelScope.launch {
+            val current = _notebooks.value
+            val updated = NotebookSet(
+                current.notebooks.map {
+                    if (it.id == id) it.copy(pinned = !it.pinned) else it
+                }
+            )
+            repository.saveNotebooks(updated)
+            _notebooks.value = updated
+        }
+    }
+
+    fun deleteNotebook(id: Long) {
+        viewModelScope.launch {
+            val current = _notebooks.value
+            if (current.notebooks.size <= 1) {
+                post("Keep at least one notebook.")
+                return@launch
+            }
+            val remaining = current.notebooks.filterNot { it.id == id }
+            val fallback = NotebookSet(remaining).displayOrder.first().id
+            val moved = repository.reassignNotebook(id, fallback)
+            val updated = NotebookSet(remaining)
+            repository.saveNotebooks(updated)
+            _notebooks.value = updated
+
+            if (_defaultNotebookId.value == id) setDefaultNotebook(fallback)
+            if (_editor.value?.notebookId == id) {
+                _editor.update { it?.copy(notebookId = fallback) }
+            }
+            post(
+                if (moved == 0) "Notebook removed."
+                else "Notebook removed and " + moved + " block(s) moved."
+            )
+        }
+    }
+
+    // -------------------------------------------------------------- settings
+
+    fun setRevealRecordedTimes(value: Boolean) {
+        settings.revealRecordedTimes = value
+        _revealRecordedTimes.value = value
+    }
+
+    fun setCollapseOldDays(value: Boolean) {
+        settings.collapseOldDays = value
+        _collapseOldDays.value = value
+    }
+
+    fun setAutoLock(millis: Long) {
+        settings.autoLockMillis = millis
+        _autoLockMillis.value = millis
+        if (millis > 0L && pendingLock != null) scheduleLock()
+    }
+
+    fun setPlaceholder(value: String) {
+        settings.placeholder = value
+        _placeholder.value = value
+    }
+
+    fun setDefaultNotebook(id: Long) {
+        settings.defaultNotebookId = id
+        _defaultNotebookId.value = id
+    }
+
+    fun setMoodEmoji(index: Int, emoji: String) {
+        val updated = _moodScale.value.withEmoji(index, emoji)
+        moodScaleStore.save(updated)
+        _moodScale.value = updated
+    }
+
+    fun setMoodLabel(index: Int, label: String) {
+        val updated = _moodScale.value.withLabel(index, label)
+        moodScaleStore.save(updated)
+        _moodScale.value = updated
+    }
+
+    fun resetMoodScale() {
+        moodScaleStore.reset()
+        _moodScale.value = MoodScale.DEFAULT
+        post("Mood scale reset.")
     }
 
     fun setReminder(enabled: Boolean, hour: Int, minute: Int) {
@@ -390,41 +654,41 @@ class JournalViewModel(
 
         if (enabled) {
             ReminderScheduler.schedule(appContext, hour, minute)
-            postMessage("Daily reminder set for %02d:%02d.".format(hour, minute))
+            post("Daily reminder set for " + "%02d:%02d".format(hour, minute) + ".")
         } else {
             ReminderScheduler.cancel(appContext)
-            postMessage("Daily reminder turned off.")
+            post("Daily reminder turned off.")
         }
     }
 
     fun changePassword(current: String, new: String, onResult: (String?) -> Unit) {
         viewModelScope.launch {
-            val error = when {
+            val result = when {
                 new.length < MIN_PASSWORD_LENGTH ->
-                    "New password must be at least $MIN_PASSWORD_LENGTH characters."
+                    "New password must be at least " + MIN_PASSWORD_LENGTH + " characters."
                 withContext(Dispatchers.Default) {
                     repository.changePassword(current.toCharArray(), new.toCharArray())
                 } -> null
                 else -> "Current password is incorrect."
             }
-            onResult(error)
+            onResult(result)
         }
     }
 
-    // --------------------------------------------------------------- backup
+    // ---------------------------------------------------------------- backup
 
     fun exportTo(uri: Uri) {
         _transferInProgress.value = true
         viewModelScope.launch {
             val result = runCatching { repository.exportTo(uri) }
             _transferInProgress.value = false
-            postMessage(
+            post(
                 result.fold(
                     onSuccess = { count ->
                         if (count == 0) "Nothing to export yet."
-                        else "Exported $count ${plural(count)}."
+                        else "Exported " + count + " " + blocks(count) + "."
                     },
-                    onFailure = { "Export failed: ${it.message ?: "unknown error"}" },
+                    onFailure = { "Export failed: " + (it.message ?: "unknown error") },
                 )
             )
         }
@@ -432,18 +696,21 @@ class JournalViewModel(
 
     fun importFrom(uri: Uri, password: String) {
         if (password.isBlank()) {
-            postMessage("Enter the password for that backup.")
+            post("Enter the password for that backup.")
             return
         }
         _transferInProgress.value = true
         viewModelScope.launch {
-            val result = runCatching { repository.importFrom(uri, password.toCharArray()) }
+            val result = runCatching {
+                repository.importFrom(uri, password.toCharArray())
+            }
             _transferInProgress.value = false
-            postMessage(
+            _notebooks.value = repository.notebooks()
+            post(
                 result.fold(
                     onSuccess = { count ->
-                        if (count == 0) "That backup had no entries in it."
-                        else "Imported $count ${plural(count)}."
+                        if (count == 0) "That backup had no blocks in it."
+                        else "Imported " + count + " " + blocks(count) + "."
                     },
                     onFailure = { it.message ?: "Import failed." },
                 )
@@ -451,21 +718,21 @@ class JournalViewModel(
         }
     }
 
-    // ------------------------------------------------------------- messages
+    // -------------------------------------------------------------- messages
 
     fun clearMessage() {
         _message.value = null
     }
 
-    private fun postMessage(text: String) {
+    private fun post(text: String) {
         _message.value = UiMessage(System.nanoTime(), text)
     }
 
-    private fun plural(count: Int) = if (count == 1) "entry" else "entries"
+    private fun blocks(count: Int) = if (count == 1) "block" else "blocks"
 
     companion object {
         const val MIN_PASSWORD_LENGTH = 6
-        const val AUTO_LOCK_DELAY_MILLIS = 2 * 60 * 1000L
+        const val MERGE_WINDOW_MILLIS = 30 * 60 * 1000L
     }
 }
 
@@ -483,6 +750,6 @@ class JournalViewModelFactory(
                 appContext = app.applicationContext,
             ) as T
         }
-        throw IllegalArgumentException("Unknown ViewModel: ${modelClass.name}")
+        throw IllegalArgumentException("Unknown ViewModel: " + modelClass.name)
     }
 }
