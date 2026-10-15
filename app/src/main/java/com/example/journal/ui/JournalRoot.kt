@@ -1,13 +1,26 @@
 package com.example.journal.ui
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.journal.JournalViewModel
 import com.example.journal.LockState
+import java.time.LocalDate
 
 @Composable
 fun JournalRoot(viewModel: JournalViewModel) {
@@ -15,17 +28,16 @@ fun JournalRoot(viewModel: JournalViewModel) {
     val lockState by viewModel.lockState.collectAsStateWithLifecycle()
     val entries by viewModel.entries.collectAsStateWithLifecycle()
     val notebooks by viewModel.notebooks.collectAsStateWithLifecycle()
+    val tasks by viewModel.tasks.collectAsStateWithLifecycle()
     val moodScale by viewModel.moodScale.collectAsStateWithLifecycle()
     val stats by viewModel.stats.collectAsStateWithLifecycle()
     val moodSeries by viewModel.moodSeries.collectAsStateWithLifecycle()
     val onThisDay by viewModel.onThisDay.collectAsStateWithLifecycle()
-    val editor by viewModel.editor.collectAsStateWithLifecycle()
+    val document by viewModel.document.collectAsStateWithLifecycle()
     val authError by viewModel.authError.collectAsStateWithLifecycle()
     val authBusy by viewModel.authBusy.collectAsStateWithLifecycle()
     val reveal by viewModel.revealRecordedTimes.collectAsStateWithLifecycle()
     val collapse by viewModel.collapseOldDays.collectAsStateWithLifecycle()
-    val expansion by viewModel.expansion.collectAsStateWithLifecycle()
-    val revealedEntries by viewModel.revealedEntries.collectAsStateWithLifecycle()
     val placeholder by viewModel.placeholder.collectAsStateWithLifecycle()
     val defaultNotebook by viewModel.defaultNotebookId.collectAsStateWithLifecycle()
     val autoLock by viewModel.autoLockMillis.collectAsStateWithLifecycle()
@@ -33,6 +45,7 @@ fun JournalRoot(viewModel: JournalViewModel) {
     val message by viewModel.message.collectAsStateWithLifecycle()
     val transfer by viewModel.transferInProgress.collectAsStateWithLifecycle()
 
+    var tab by rememberSaveable { mutableStateOf(0) }
     var settingsOpen by rememberSaveable { mutableStateOf(false) }
 
     when (lockState) {
@@ -49,31 +62,45 @@ fun JournalRoot(viewModel: JournalViewModel) {
         )
 
         LockState.Unlocked -> {
-            val open = editor
+            val open = document
             when {
-                open != null -> EditorScreen(
-                    state = open,
-                    moodScale = moodScale,
-                    notebooks = notebooks,
-                    placeholder = placeholder,
-                    onTextChange = viewModel::updateText,
-                    onDateChange = viewModel::setDate,
-                    onTimeChange = viewModel::setTime,
-                    onValenceChange = viewModel::setValence,
-                    onCustomMoodChange = viewModel::setCustomMood,
-                    onNotebookChange = viewModel::setDraftNotebook,
-                    onCreateNotebook = { viewModel.createNotebook(it, select = true) },
-                    onStartNewBlock = viewModel::startNewBlock,
-                    onToggleLock = viewModel::toggleDraftLock,
-                    onAddPhotoFromUri = viewModel::addPhotoFromUri,
-                    onAddPhotoFromFile = viewModel::addPhotoFromFile,
-                    onRemovePhoto = viewModel::removePhoto,
-                    thumbnailFor = viewModel::thumbnailFor,
-                    fullImageFor = viewModel::fullImageFor,
-                    onSave = viewModel::saveDraft,
-                    onDelete = viewModel::deleteEntry,
-                    onClose = viewModel::closeEditor,
-                )
+                open != null -> {
+                    val dayTasks = tasks.filter { task ->
+                        val completedHere = task.completedAt?.let { stamp ->
+                            java.time.Instant.ofEpochMilli(stamp)
+                                .atZone(java.time.ZoneId.systemDefault())
+                                .toLocalDate() == open.date
+                        } ?: false
+                        task.dueDate == open.date || completedHere
+                    }
+                    DayDocumentScreen(
+                        document = open,
+                        notebooks = notebooks,
+                        moodScale = moodScale,
+                        notebookTabs = entries
+                            .filter { it.date == open.date }
+                            .map { it.notebookId }
+                            .distinct(),
+                        dayTasks = dayTasks,
+                        placeholder = placeholder,
+                        revealRecordedTimes = reveal,
+                        onBack = viewModel::closeDocument,
+                        onSelectNotebook = viewModel::switchDocumentNotebook,
+                        onTextChange = viewModel::updateSectionText,
+                        onSectionValence = viewModel::setSectionValence,
+                        onSectionCustomMood = viewModel::setSectionCustomMood,
+                        onAddSection = viewModel::addSection,
+                        onToggleSectionLock = viewModel::toggleSectionLock,
+                        onMoveSection = viewModel::moveSection,
+                        onDeleteSection = viewModel::deleteSection,
+                        onAddPhoto = viewModel::addPhotoToSection,
+                        onAddPhotoFile = viewModel::addPhotoFileToSection,
+                        onRemovePhoto = viewModel::removePhotoFromSection,
+                        thumbnailFor = viewModel::thumbnailFor,
+                        fullImageFor = viewModel::fullImageFor,
+                        onTaskToggle = viewModel::toggleTask,
+                    )
+                }
 
                 settingsOpen -> SettingsScreen(
                     notebooks = notebooks,
@@ -107,30 +134,69 @@ fun JournalRoot(viewModel: JournalViewModel) {
                     onLockNow = viewModel::lock,
                 )
 
-                else -> JournalListScreen(
-                    entries = entries,
-                    notebooks = notebooks,
-                    stats = stats,
-                    moodSeries = moodSeries,
-                    moodScale = moodScale,
-                    onThisDayHits = onThisDay,
-                    revealedEntryIds = revealedEntries,
-                    revealRecordedTimes = reveal,
-                    collapseOldDays = collapse,
-                    expansion = expansion,
-                    message = message,
-                    transferInProgress = transfer,
-                    onMessageShown = viewModel::clearMessage,
-                    onNewBlock = { viewModel.openNewEntry() },
-                    onNewBlockForDate = { viewModel.openNewEntry(it, null) },
-                    onOpenEntry = viewModel::openEntry,
-                    onRevealEntry = viewModel::revealEntry,
-                    onToggleDay = viewModel::toggleDay,
-                    onOpenSettings = { settingsOpen = true },
-                    onLock = viewModel::lock,
-                    onExport = viewModel::exportTo,
-                    onImport = viewModel::importFrom,
-                )
+                else -> Scaffold(
+                    bottomBar = {
+                        NavigationBar {
+                            NavigationBarItem(
+                                selected = tab == 0,
+                                onClick = { tab = 0 },
+                                icon = {
+                                    Icon(Icons.Default.Edit, contentDescription = null)
+                                },
+                                label = { Text("Journal") },
+                            )
+                            NavigationBarItem(
+                                selected = tab == 1,
+                                onClick = { tab = 1 },
+                                icon = {
+                                    Icon(Icons.Default.Check, contentDescription = null)
+                                },
+                                label = { Text("Tasks") },
+                            )
+                        }
+                    },
+                ) { inner ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(inner),
+                    ) {
+                        if (tab == 0) {
+                            JournalListScreen(
+                                entries = entries,
+                                notebooks = notebooks,
+                                stats = stats,
+                                moodSeries = moodSeries,
+                                moodScale = moodScale,
+                                onThisDayHits = onThisDay,
+                                revealRecordedTimes = reveal,
+                                collapseOldDays = collapse,
+                                message = message,
+                                transferInProgress = transfer,
+                                onMessageShown = viewModel::clearMessage,
+                                onNewBlock = { viewModel.openToday() },
+                                onOpenDay = { date: LocalDate, notebookId: Long ->
+                                    viewModel.openDay(date, notebookId)
+                                },
+                                onOpenSettings = { settingsOpen = true },
+                            )
+                        } else {
+                            TasksScreen(
+                                tasks = tasks,
+                                notebooks = notebooks,
+                                message = message,
+                                onMessageShown = viewModel::clearMessage,
+                                onOpenSettings = { settingsOpen = true },
+                                onAdd = { title, note, due, time, notebook ->
+                                    viewModel.addTask(title, note, due, time, notebook)
+                                },
+                                onUpdate = viewModel::updateTask,
+                                onToggle = viewModel::toggleTask,
+                                onDelete = viewModel::deleteTask,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

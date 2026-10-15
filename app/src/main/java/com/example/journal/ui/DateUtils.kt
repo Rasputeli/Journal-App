@@ -12,7 +12,8 @@ private val shortDate = DateTimeFormatter.ofPattern("d MMM yyyy")
 private val stamp = DateTimeFormatter.ofPattern("d MMM yyyy, HH:mm")
 private val clock = DateTimeFormatter.ofPattern("HH:mm")
 
-fun LocalDate.toUtcMillis(): Long = atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+fun LocalDate.toUtcMillis(): Long =
+    atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
 
 fun Long.utcToLocalDate(): LocalDate =
     Instant.ofEpochMilli(this).atZone(ZoneOffset.UTC).toLocalDate()
@@ -41,9 +42,17 @@ fun Long.hourOfDay(): Int =
 fun Long.minuteOfHour(): Int =
     Instant.ofEpochMilli(this).atZone(ZoneId.systemDefault()).minute
 
-/** Combines a day with a time of day into the instant a block stores. */
 fun LocalDate.atTimeOfDay(hour: Int, minute: Int): Long =
     atTime(LocalTime.of(hour.coerceIn(0, 23), minute.coerceIn(0, 59)))
         .atZone(ZoneId.systemDefault())
         .toInstant()
         .toEpochMilli()
+
+/** The moment "now" on a given day, used when backfilling a block. */
+fun LocalDate.withCurrentTimeOfDay(): Long {
+    val now = LocalTime.now()
+    return atTimeOfDay(now.hour, now.minute)
+}
+
+fun minutesToLabel(minutes: Int): String =
+    "%02d:%02d".format(minutes / 60, minutes % 60)

@@ -15,17 +15,15 @@ import com.example.journal.data.MoodScaleStore
 import com.example.journal.data.Notebook
 import com.example.journal.data.NotebookSet
 import com.example.journal.data.SettingsStore
+import com.example.journal.data.Task
 import com.example.journal.ui.JournalStats
-import com.example.journal.ui.atTimeOfDay
 import com.example.journal.ui.MoodPoint
 import com.example.journal.ui.OnThisDayHit
 import com.example.journal.ui.computeMoodSeries
 import com.example.journal.ui.computeOnThisDay
 import com.example.journal.ui.computeStats
 import com.example.journal.ui.decodeSampled
-import com.example.journal.ui.hourOfDay
-import com.example.journal.ui.minuteOfHour
-import com.example.journal.ui.timeLabel
+import com.example.journal.ui.withCurrentTimeOfDay
 import com.example.journal.widget.JournalWidget
 import com.example.journal.work.ReminderScheduler
 import kotlinx.coroutines.Dispatchers
@@ -52,47 +50,23 @@ sealed interface LockState {
     data object Unlocked : LockState
 }
 
-/**
- * The block open in the editor. It lives here rather than in the composable so
- * a background auto-lock never throws away unsaved text.
- */
-data class EditorState(
-    val entryId: Long?,
-    val originalText: String,
-    val originalDate: LocalDate,
-    val originalEventTime: Long,
-    val originalValence: Int?,
-    val originalCustomMood: String?,
-    val originalNotebookId: Long,
-    val originalLocked: Boolean,
-    val originalAttachments: List<String>,
-    val text: String,
-    val date: LocalDate,
+data class DocumentSection(
+    val id: Long,
     val eventTime: Long,
+    val text: String,
     val valence: Int?,
     val customMood: String?,
-    val notebookId: Long,
     val locked: Boolean,
     val attachments: List<String>,
-    val merged: Boolean = false,
-    val recordedAt: Long? = null,
-    val updatedAt: Long? = null,
-) {
-    val isNew: Boolean get() = entryId == null
+    val recordedAt: Long?,
+    val updatedAt: Long?,
+)
 
-    val isDirty: Boolean
-        get() = text != originalText ||
-                date != originalDate ||
-                eventTime != originalEventTime ||
-                valence != originalValence ||
-                customMood != originalCustomMood ||
-                notebookId != originalNotebookId ||
-                locked != originalLocked ||
-                attachments != originalAttachments
-
-    /** True while the merge banner can still be dismissed without losing typing. */
-    val canUndoMerge: Boolean get() = merged && text == originalText
-}
+data class DayDocument(
+    val date: LocalDate,
+    val notebookId: Long,
+    val sections: List<DocumentSection>,
+)
 
 data class ReminderSettings(val enabled: Boolean, val hour: Int, val minute: Int)
 
@@ -119,18 +93,14 @@ class JournalViewModel(
     private val _authBusy = MutableStateFlow(false)
     val authBusy: StateFlow<Boolean> = _authBusy.asStateFlow()
 
-    private val _editor = MutableStateFlow<EditorState?>(null)
-    val editor: StateFlow<EditorState?> = _editor.asStateFlow()
-
-    private val _revealedEntries = MutableStateFlow<Set<Long>>(emptySet())
-    val revealedEntries: StateFlow<Set<Long>> = _revealedEntries.asStateFlow()
-
-    /** User overrides for day collapsing. Cleared whenever the journal locks. */
-    private val _expansion = MutableStateFlow<Map<LocalDate, Boolean>>(emptyMap())
-    val expansion: StateFlow<Map<LocalDate, Boolean>> = _expansion.asStateFlow()
+    private val _document = MutableStateFlow<DayDocument?>(null)
+    val document: StateFlow<DayDocument?> = _document.asStateFlow()
 
     private val _notebooks = MutableStateFlow(NotebookSet.DEFAULT)
     val notebooks: StateFlow<NotebookSet> = _notebooks.asStateFlow()
+
+    private val _tasks = MutableStateFlow<List<Task>>(emptyList())
+    val tasks: StateFlow<List<Task>> = _tasks.asStateFlow()
 
     private val _moodScale = MutableStateFlow(moodScaleStore.load())
     val moodScale: StateFlow<MoodScale> = _moodScale.asStateFlow()
@@ -151,7 +121,11 @@ class JournalViewModel(
     val defaultNotebookId: StateFlow<Long> = _defaultNotebookId.asStateFlow()
 
     private val _reminder = MutableStateFlow(
-        ReminderSettings(settings.reminderEnabled, settings.reminderHour, settings.reminderMinute)
+        ReminderSettings(
+            settings.reminderEnabled,
+            settings.reminderHour,
+            settings.reminderMinute,
+        )
     )
     val reminder: StateFlow<ReminderSettings> = _reminder.asStateFlow()
 
@@ -162,6 +136,8 @@ class JournalViewModel(
     val transferInProgress: StateFlow<Boolean> = _transferInProgress.asStateFlow()
 
     private var pendingLock: Job? = null
+    private var autosaveJob: Job? = null
+    private var documentDirty = false
     private var pendingNewEntry = false
 
     private val thumbnails = HashMap<String, ImageBitmap>()
@@ -195,7 +171,7 @@ class JournalViewModel(
         }
     }
 
-    // --------------------------------------------------------------- locking
+    // ------------------------------------------------------------- locking
 
     fun setupPassword(password: String, confirm: String) {
         val error = when {
@@ -240,41 +216,34 @@ class JournalViewModel(
         }
     }
 
-    fun revealEntry(entryId: Long, password: String, onResult: (Boolean) -> Unit) {
-        viewModelScope.launch {
-            val ok = withContext(Dispatchers.Default) {
-                auth.unlock(password.toCharArray())
-            }
-            if (ok) _revealedEntries.update { it + entryId }
-            onResult(ok)
-        }
-    }
-
     private fun afterUnlock() {
         if (pendingNewEntry) {
             pendingNewEntry = false
-            openNewEntry()
+            openToday()
         }
         viewModelScope.launch {
             val set = repository.notebooks()
             _notebooks.value = set
             repository.saveNotebooks(set)
+            _tasks.value = repository.tasks()
             repository.cleanUpAttachments()
         }
     }
 
     fun requestNewEntry() {
-        if (_lockState.value == LockState.Unlocked) openNewEntry() else pendingNewEntry = true
+        if (_lockState.value == LockState.Unlocked) openToday() else pendingNewEntry = true
     }
 
     fun lock() {
         if (_lockState.value != LockState.Unlocked) return
+        viewModelScope.launch { flushDocument() }
         pendingLock?.cancel()
         pendingLock = null
+        autosaveJob?.cancel()
         auth.lock()
-        _revealedEntries.value = emptySet()
-        _expansion.value = emptyMap()
         thumbnails.clear()
+        _document.value = null
+        _tasks.value = emptyList()
         _lockState.value = LockState.Locked
     }
 
@@ -294,176 +263,232 @@ class JournalViewModel(
         pendingLock = null
     }
 
-    fun toggleDay(date: LocalDate, currentlyExpanded: Boolean) {
-        _expansion.update { it + (date to !currentlyExpanded) }
+    // --------------------------------------------------------- day documents
+
+    fun openToday() {
+        val set = _notebooks.value
+        val configured = _defaultNotebookId.value
+        val notebookId = if (set.byId(configured) != null) configured
+        else set.firstId ?: NotebookSet.DEFAULT_ID
+        openDay(LocalDate.now(), notebookId)
     }
 
-    // ---------------------------------------------------------------- editor
+    fun openDay(date: LocalDate, notebookId: Long) {
+        viewModelScope.launch {
+            val blocks = repository.blocksForDay(date)
+                .filter { it.notebookId == notebookId }
+                .map { it.toSection() }
+                .toMutableList()
 
-    fun openNewEntry() = openNewEntry(LocalDate.now(), null)
-
-    fun openNewEntry(date: LocalDate, notebookId: Long?) =
-        beginNewBlock(date, notebookId, forceNew = false)
-
-    private fun beginNewBlock(date: LocalDate, notebookId: Long?, forceNew: Boolean) {
-        val target = notebookId ?: resolvedDefaultNotebookId()
-
-        if (!forceNew && date == LocalDate.now()) {
             val now = System.currentTimeMillis()
-            val recent = entries.value
-                .filter { it.date == date && !it.locked && it.notebookId == target }
-                .maxByOrNull { it.updatedAt }
-            if (recent != null && now - recent.updatedAt <= MERGE_WINDOW_MILLIS) {
-                post("Continuing your " + recent.eventTime.timeLabel() + " block.")
-                openExisting(recent, merged = true)
-                return
+            val lastTouched = blocks.maxOfOrNull { it.updatedAt ?: 0L } ?: 0L
+            val stale = blocks.isEmpty() || now - lastTouched > MERGE_WINDOW_MILLIS
+
+            if (stale) {
+                blocks += DocumentSection(
+                    id = 0L,
+                    eventTime = if (date == LocalDate.now()) now
+                    else date.withCurrentTimeOfDay(),
+                    text = "",
+                    valence = null,
+                    customMood = null,
+                    locked = false,
+                    attachments = emptyList(),
+                    recordedAt = null,
+                    updatedAt = null,
+                )
+            }
+
+            documentDirty = false
+            _document.value = DayDocument(date, notebookId, blocks)
+        }
+    }
+
+    fun switchDocumentNotebook(notebookId: Long) {
+        val current = _document.value ?: return
+        if (current.notebookId == notebookId) return
+        viewModelScope.launch {
+            flushDocument()
+            openDay(current.date, notebookId)
+        }
+    }
+
+    fun closeDocument() {
+        viewModelScope.launch {
+            flushDocument()
+            _document.value = null
+        }
+    }
+
+    fun updateSectionText(index: Int, text: String) {
+        mutateSection(index) { it.copy(text = text) }
+    }
+
+    fun setSectionValence(index: Int, valence: Int?) {
+        mutateSection(index) { it.copy(valence = valence, customMood = null) }
+    }
+
+    fun setSectionCustomMood(index: Int, emoji: String?) {
+        mutateSection(index) { it.copy(customMood = emoji, valence = null) }
+    }
+
+    fun toggleSectionLock(index: Int) {
+        mutateSection(index) { it.copy(locked = !it.locked) }
+    }
+
+    fun addSection() {
+        val current = _document.value ?: return
+        val stamp = if (current.date == LocalDate.now()) System.currentTimeMillis()
+        else current.date.withCurrentTimeOfDay()
+        val added = current.sections + DocumentSection(
+            id = 0L,
+            eventTime = stamp,
+            text = "",
+            valence = null,
+            customMood = null,
+            locked = false,
+            attachments = emptyList(),
+            recordedAt = null,
+            updatedAt = null,
+        )
+        _document.value = current.copy(sections = added)
+        documentDirty = true
+        scheduleAutosave()
+    }
+
+    fun deleteSection(index: Int) {
+        val current = _document.value ?: return
+        val section = current.sections.getOrNull(index) ?: return
+        _document.value = current.copy(
+            sections = current.sections.filterIndexed { i, _ -> i != index }
+        )
+        viewModelScope.launch {
+            if (section.id != 0L) repository.delete(section.id)
+        }
+    }
+
+    fun moveSection(index: Int, date: LocalDate) {
+        val current = _document.value ?: return
+        val section = current.sections.getOrNull(index) ?: return
+        viewModelScope.launch {
+            flushDocument()
+            if (section.id != 0L) {
+                repository.save(
+                    id = section.id,
+                    date = date,
+                    eventTime = date.withCurrentTimeOfDay(),
+                    text = section.text,
+                    valence = section.valence,
+                    customMood = section.customMood,
+                    notebookId = current.notebookId,
+                    locked = section.locked,
+                    attachmentNames = section.attachments,
+                )
+                repository.delete(section.id)
+                repository.save(
+                    id = null,
+                    date = date,
+                    eventTime = date.withCurrentTimeOfDay(),
+                    text = section.text,
+                    valence = section.valence,
+                    customMood = section.customMood,
+                    notebookId = current.notebookId,
+                    locked = section.locked,
+                    attachmentNames = section.attachments,
+                )
+            }
+            openDay(current.date, current.notebookId)
+            post("Moved to " + date.shortLabel() + ".")
+        }
+    }
+
+    private fun mutateSection(index: Int, transform: (DocumentSection) -> DocumentSection) {
+        val current = _document.value ?: return
+        val updated = current.sections.mapIndexed { i, section ->
+            if (i == index) transform(section) else section
+        }
+        _document.value = current.copy(sections = updated)
+        documentDirty = true
+        scheduleAutosave()
+    }
+
+    private fun scheduleAutosave() {
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            delay(AUTOSAVE_DEBOUNCE_MILLIS)
+            flushDocument()
+        }
+    }
+
+    private suspend fun flushDocument() {
+        val current = _document.value ?: return
+        if (!documentDirty) return
+        documentDirty = false
+
+        val now = System.currentTimeMillis()
+        val kept = mutableListOf<DocumentSection>()
+
+        for (section in current.sections) {
+            if (section.text.isBlank()) {
+                if (section.id != 0L) repository.delete(section.id)
+                continue
+            }
+            if (section.id == 0L) {
+                val newId = repository.save(
+                    id = null,
+                    date = current.date,
+                    eventTime = section.eventTime,
+                    text = section.text,
+                    valence = section.valence,
+                    customMood = section.customMood,
+                    notebookId = current.notebookId,
+                    locked = section.locked,
+                    attachmentNames = section.attachments,
+                )
+                kept += section.copy(id = newId, recordedAt = now, updatedAt = now)
+            } else {
+                repository.save(
+                    id = section.id,
+                    date = current.date,
+                    eventTime = section.eventTime,
+                    text = section.text,
+                    valence = section.valence,
+                    customMood = section.customMood,
+                    notebookId = current.notebookId,
+                    locked = section.locked,
+                    attachmentNames = section.attachments,
+                )
+                kept += section
             }
         }
 
-        val eventTime = date.atTimeOfDay(
-            System.currentTimeMillis().hourOfDay(),
-            System.currentTimeMillis().minuteOfHour(),
-        )
-        _editor.value = EditorState(
-            entryId = null,
-            originalText = "",
-            originalDate = date,
-            originalEventTime = eventTime,
-            originalValence = null,
-            originalCustomMood = null,
-            originalNotebookId = target,
-            originalLocked = false,
-            originalAttachments = emptyList(),
-            text = "",
-            date = date,
-            eventTime = eventTime,
-            valence = null,
-            customMood = null,
-            notebookId = target,
-            locked = false,
-            attachments = emptyList(),
-        )
+        _document.value = current.copy(sections = kept)
     }
 
-    /** Abandons a merge and starts a genuinely new block instead. */
-    fun startNewBlock() {
-        val current = _editor.value ?: return
-        if (!current.canUndoMerge) return
-        beginNewBlock(current.date, current.notebookId, forceNew = true)
-    }
-
-    fun openEntry(entry: JournalEntry) = openExisting(entry, merged = false)
-
-    private fun openExisting(entry: JournalEntry, merged: Boolean) {
-        _editor.value = EditorState(
-            entryId = entry.id,
-            originalText = entry.text,
-            originalDate = entry.date,
-            originalEventTime = entry.eventTime,
-            originalValence = entry.valence,
-            originalCustomMood = entry.customMood,
-            originalNotebookId = entry.notebookId,
-            originalLocked = entry.locked,
-            originalAttachments = entry.attachments,
-            text = entry.text,
-            date = entry.date,
-            eventTime = entry.eventTime,
-            valence = entry.valence,
-            customMood = entry.customMood,
-            notebookId = entry.notebookId,
-            locked = entry.locked,
-            attachments = entry.attachments,
-            merged = merged,
-            recordedAt = entry.recordedAt,
-            updatedAt = entry.updatedAt,
-        )
-    }
-
-    fun updateText(text: String) {
-        _editor.update { it?.copy(text = text) }
-    }
-
-    fun setDate(date: LocalDate) {
-        _editor.update { current ->
-            if (current == null) null
-            else current.copy(
-                date = date,
-                eventTime = date.atTimeOfDay(
-                    current.eventTime.hourOfDay(),
-                    current.eventTime.minuteOfHour(),
-                ),
-            )
-        }
-    }
-
-    fun setTime(hour: Int, minute: Int) {
-        _editor.update { current ->
-            current?.copy(eventTime = current.date.atTimeOfDay(hour, minute))
-        }
-    }
-
-    fun setValence(valence: Int?) {
-        _editor.update { it?.copy(valence = valence, customMood = null) }
-    }
-
-    fun setCustomMood(emoji: String?) {
-        _editor.update { it?.copy(customMood = emoji, valence = null) }
-    }
-
-    fun setDraftNotebook(notebookId: Long) {
-        _editor.update { it?.copy(notebookId = notebookId) }
-    }
-
-    fun toggleDraftLock() {
-        _editor.update { it?.copy(locked = !it.locked) }
-    }
-
-    fun removePhoto(name: String) {
-        _editor.update { it?.copy(attachments = it.attachments - name) }
-    }
-
-    fun closeEditor() {
-        _editor.value = null
-    }
-
-    fun saveDraft() {
-        val draft = _editor.value ?: return
-        if (draft.text.isBlank()) return
-        viewModelScope.launch {
-            repository.save(
-                id = draft.entryId,
-                date = draft.date,
-                eventTime = draft.eventTime,
-                text = draft.text.trim(),
-                valence = draft.valence,
-                customMood = draft.customMood,
-                notebookId = draft.notebookId,
-                locked = draft.locked,
-                attachmentNames = draft.attachments,
-            )
-            _editor.value = null
-        }
-    }
-
-    fun deleteEntry(id: Long) {
-        viewModelScope.launch {
-            repository.delete(id)
-            if (_editor.value?.entryId == id) _editor.value = null
-        }
-    }
+    private fun JournalEntry.toSection() = DocumentSection(
+        id = id,
+        eventTime = eventTime,
+        text = text,
+        valence = valence,
+        customMood = customMood,
+        locked = locked,
+        attachments = attachments,
+        recordedAt = recordedAt,
+        updatedAt = updatedAt,
+    )
 
     // ---------------------------------------------------------------- photos
 
-    fun addPhotoFromUri(uri: Uri) {
-        ingestPhoto {
+    fun addPhotoToSection(index: Int, uri: Uri) {
+        ingestPhoto(index) {
             withContext(Dispatchers.IO) {
                 appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             }
         }
     }
 
-    fun addPhotoFromFile(file: File) {
-        ingestPhoto {
+    fun addPhotoFileToSection(index: Int, file: File) {
+        ingestPhoto(index) {
             withContext(Dispatchers.IO) {
                 val bytes = file.takeIf { it.isFile }?.readBytes()
                 file.delete()
@@ -472,8 +497,8 @@ class JournalViewModel(
         }
     }
 
-    private fun ingestPhoto(loader: suspend () -> ByteArray?) {
-        if (_editor.value == null) return
+    private fun ingestPhoto(index: Int, loader: suspend () -> ByteArray?) {
+        if (_document.value == null) return
         viewModelScope.launch {
             val raw = loader()
             if (raw == null) {
@@ -492,8 +517,12 @@ class JournalViewModel(
                 post("Could not save the picture.")
                 return@launch
             }
-            _editor.update { it?.copy(attachments = it.attachments + name) }
+            mutateSection(index) { it.copy(attachments = it.attachments + name) }
         }
+    }
+
+    fun removePhotoFromSection(index: Int, name: String) {
+        mutateSection(index) { it.copy(attachments = it.attachments - name) }
     }
 
     suspend fun thumbnailFor(name: String): ImageBitmap? {
@@ -514,13 +543,6 @@ class JournalViewModel(
 
     // ------------------------------------------------------------- notebooks
 
-    private fun resolvedDefaultNotebookId(): Long {
-        val set = _notebooks.value
-        val configured = _defaultNotebookId.value
-        return if (set.byId(configured) != null) configured
-        else set.firstId ?: NotebookSet.DEFAULT_ID
-    }
-
     fun createNotebook(name: String, select: Boolean = false) {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return
@@ -532,12 +554,16 @@ class JournalViewModel(
             }
             val nextId = (current.notebooks.maxOfOrNull { it.id } ?: 0L) + 1L
             val updated = NotebookSet(
-                current.notebooks +
-                    Notebook(nextId, trimmed, pinned = false, order = current.notebooks.size)
+                current.notebooks + Notebook(
+                    id = nextId,
+                    name = trimmed,
+                    pinned = false,
+                    order = current.notebooks.size,
+                )
             )
             repository.saveNotebooks(updated)
             _notebooks.value = updated
-            if (select) _editor.update { it?.copy(notebookId = nextId) }
+            if (select) switchDocumentNotebook(nextId)
         }
     }
 
@@ -590,18 +616,84 @@ class JournalViewModel(
             repository.saveNotebooks(updated)
             _notebooks.value = updated
 
+            val newTasks = _tasks.value.map {
+                if (it.notebookId == id) it.copy(notebookId = fallback) else it
+            }
+            _tasks.value = newTasks
+            repository.saveTasks(newTasks)
+
             if (_defaultNotebookId.value == id) setDefaultNotebook(fallback)
-            if (_editor.value?.notebookId == id) {
-                _editor.update { it?.copy(notebookId = fallback) }
+            if (_document.value?.notebookId == id) {
+                _document.value = _document.value?.copy(notebookId = fallback)
             }
             post(
                 if (moved == 0) "Notebook removed."
-                else "Notebook removed and " + moved + " block(s) moved."
+                else "Notebook removed and " + moved + " section(s) moved."
             )
         }
     }
 
-    // -------------------------------------------------------------- settings
+    // ------------------------------------------------------------------ tasks
+
+    fun addTask(
+        title: String,
+        note: String,
+        dueDate: LocalDate?,
+        dueTimeMinutes: Int?,
+        notebookId: Long,
+    ) {
+        val trimmed = title.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val nextId = (_tasks.value.maxOfOrNull { it.id } ?: 0L) + 1L
+            val updated = _tasks.value + Task(
+                id = nextId,
+                title = trimmed,
+                done = false,
+                completedAt = null,
+                dueDate = dueDate,
+                dueTimeMinutes = dueTimeMinutes,
+                note = note,
+                notebookId = notebookId,
+                createdAt = now,
+                updatedAt = now,
+            )
+            _tasks.value = updated
+            repository.saveTasks(updated)
+        }
+    }
+
+    fun updateTask(task: Task) {
+        viewModelScope.launch {
+            val updated = _tasks.value.map { if (it.id == task.id) task else it }
+            _tasks.value = updated
+            repository.saveTasks(updated)
+        }
+    }
+
+    fun toggleTask(id: Long) {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            val updated = _tasks.value.map { task ->
+                if (task.id != id) task
+                else if (task.done) task.copy(done = false, completedAt = null, updatedAt = now)
+                else task.copy(done = true, completedAt = now, updatedAt = now)
+            }
+            _tasks.value = updated
+            repository.saveTasks(updated)
+        }
+    }
+
+    fun deleteTask(id: Long) {
+        viewModelScope.launch {
+            val updated = _tasks.value.filterNot { it.id == id }
+            _tasks.value = updated
+            repository.saveTasks(updated)
+        }
+    }
+
+    // --------------------------------------------------------------- settings
 
     fun setRevealRecordedTimes(value: Boolean) {
         settings.revealRecordedTimes = value
@@ -676,18 +768,19 @@ class JournalViewModel(
         }
     }
 
-    // ---------------------------------------------------------------- backup
+    // ----------------------------------------------------------------- backup
 
     fun exportTo(uri: Uri) {
         _transferInProgress.value = true
         viewModelScope.launch {
+            flushDocument()
             val result = runCatching { repository.exportTo(uri) }
             _transferInProgress.value = false
             post(
                 result.fold(
                     onSuccess = { count ->
                         if (count == 0) "Nothing to export yet."
-                        else "Exported " + count + " " + blocks(count) + "."
+                        else "Exported " + count + " " + sections(count) + "."
                     },
                     onFailure = { "Export failed: " + (it.message ?: "unknown error") },
                 )
@@ -707,11 +800,12 @@ class JournalViewModel(
             }
             _transferInProgress.value = false
             _notebooks.value = repository.notebooks()
+            _tasks.value = repository.tasks()
             post(
                 result.fold(
                     onSuccess = { count ->
-                        if (count == 0) "That backup had no blocks in it."
-                        else "Imported " + count + " " + blocks(count) + "."
+                        if (count == 0) "That backup had no sections in it."
+                        else "Imported " + count + " " + sections(count) + "."
                     },
                     onFailure = { it.message ?: "Import failed." },
                 )
@@ -719,7 +813,7 @@ class JournalViewModel(
         }
     }
 
-    // -------------------------------------------------------------- messages
+    // --------------------------------------------------------------- messages
 
     fun clearMessage() {
         _message.value = null
@@ -729,11 +823,12 @@ class JournalViewModel(
         _message.value = UiMessage(System.nanoTime(), text)
     }
 
-    private fun blocks(count: Int) = if (count == 1) "block" else "blocks"
+    private fun sections(count: Int) = if (count == 1) "section" else "sections"
 
     companion object {
         const val MIN_PASSWORD_LENGTH = 6
         const val MERGE_WINDOW_MILLIS = 30 * 60 * 1000L
+        const val AUTOSAVE_DEBOUNCE_MILLIS = 1200L
     }
 }
 

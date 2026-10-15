@@ -13,13 +13,27 @@ android {
         applicationId = "com.example.journal"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 20261015
+        versionName = "0.2.0"
+    }
+
+    signingConfigs {
+        create("journal") {
+            storeFile = rootProject.file("keystore/journal.jks")
+            storePassword = "journal-continuity-key"
+            keyAlias = "journal"
+            keyPassword = "journal-continuity-key"
+            storeType = "JKS"
+        }
     }
 
     buildTypes {
-        release {
+        getByName("debug") {
+            signingConfig = signingConfigs.getByName("journal")
+        }
+        getByName("release") {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("journal")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

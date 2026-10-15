@@ -6,15 +6,11 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -31,62 +27,42 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 
 @Composable
-fun PhotoStrip(
+fun SectionPhotos(
     names: List<String>,
     thumbnailFor: suspend (String) -> ImageBitmap?,
     fullImageFor: suspend (String) -> ImageBitmap?,
-    onRemove: (String) -> Unit,
-    onAddFromGallery: () -> Unit,
-    onTakePhoto: () -> Unit,
 ) {
+    if (names.isEmpty()) return
     var viewing by remember { mutableStateOf<String?>(null) }
 
     LazyRow(
-        contentPadding = PaddingValues(horizontal = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(top = 6.dp),
     ) {
-        item {
-            AssistChip(onClick = onTakePhoto, label = { Text("Camera") })
-        }
-        item {
-            AssistChip(onClick = onAddFromGallery, label = { Text("Gallery") })
-        }
         items(names.size) { index ->
             val name = names[index]
-            Box {
-                AttachmentThumbnail(
-                    name = name,
-                    thumbnailFor = thumbnailFor,
-                    onClick = { viewing = name },
-                )
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .size(20.dp)
-                        .clickable { onRemove(name) },
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text("x", fontSize = 11.sp)
-                    }
-                }
-            }
+            Thumbnail(
+                name = name,
+                thumbnailFor = thumbnailFor,
+                onClick = { viewing = name },
+            )
         }
     }
 
     viewing?.let { name ->
-        PhotoViewer(name = name, fullImageFor = fullImageFor, onDismiss = { viewing = null })
+        PhotoViewer(
+            name = name,
+            fullImageFor = fullImageFor,
+            onDismiss = { viewing = null },
+        )
     }
 }
 
 @Composable
-private fun AttachmentThumbnail(
+private fun Thumbnail(
     name: String,
     thumbnailFor: suspend (String) -> ImageBitmap?,
     onClick: () -> Unit,
@@ -97,7 +73,7 @@ private fun AttachmentThumbnail(
 
     Box(
         modifier = Modifier
-            .size(76.dp)
+            .size(84.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .clickable(onClick = onClick),
@@ -111,7 +87,7 @@ private fun AttachmentThumbnail(
                 bitmap = picture,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -128,10 +104,7 @@ private fun PhotoViewer(
     }
 
     Dialog(onDismissRequest = onDismiss) {
-        Surface(
-            shape = RoundedCornerShape(16.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
+        Surface(shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(12.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -148,7 +121,7 @@ private fun PhotoViewer(
                     )
                 }
                 Text(
-                    "Tap outside to close",
+                    text = "Tap outside to close",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp),

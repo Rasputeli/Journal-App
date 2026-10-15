@@ -10,6 +10,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDate
+import javax.crypto.SecretKey
 
 class EntryRepository(
     private val dao: EntryDao,
@@ -18,34 +19,49 @@ class EntryRepository(
     private val context: Context,
     private val attachments: AttachmentStore = AttachmentStore(context),
     private val notebookStore: NotebookStore = NotebookStore(context),
+    private val taskStore: TaskStore = TaskStore(context),
 ) {
 
-    fun observeEntries(): Flow<List<JournalEntry>> = dao.observeAll().map(::decryptAll)
+    // ---------------------------------------------------------------- reading
 
-    private fun decryptAll(rows: List<Entry>): List<JournalEntry> {
+    fun observeEntries(): Flow<List<JournalEntry>> = dao.observeAll().map(::decodeRows)
+
+    private fun decodeRows(rows: List<Entry>): List<JournalEntry> {
         val key = auth.currentKeyOrNull() ?: return emptyList()
-        return rows.mapNotNull { row ->
-            runCatching {
-                val payload = PayloadCodec.decode(
-                    CryptoManager.decrypt(key, row.cipherText, row.iv)
-                )
-                JournalEntry(
-                    id = row.id,
-                    date = LocalDate.parse(row.entryDate),
-                    eventTime = payload.eventTime ?: row.createdAt,
-                    recordedAt = row.createdAt,
-                    updatedAt = row.updatedAt,
-                    text = payload.text,
-                    valence = payload.valence,
-                    customMood = payload.customMood,
-                    notebookId = payload.notebookId ?: NotebookSet.DEFAULT_ID,
-                    locked = payload.locked,
-                    attachments = payload.attachments,
-                    tags = TagParser.tagsOf(payload.text),
-                )
-            }.getOrNull()
-        }
+        return rows.mapNotNull { decodeRow(key, it) }
     }
+
+    private fun decodeRow(key: SecretKey, row: Entry): JournalEntry? = runCatching {
+        val payload = PayloadCodec.decode(
+            CryptoManager.decrypt(key, row.cipherText, row.iv)
+        )
+        JournalEntry(
+            id = row.id,
+            date = LocalDate.parse(row.entryDate),
+            eventTime = payload.eventTime ?: row.createdAt,
+            recordedAt = row.createdAt,
+            updatedAt = row.updatedAt,
+            text = payload.text,
+            valence = payload.valence,
+            customMood = payload.customMood,
+            notebookId = payload.notebookId ?: NotebookSet.DEFAULT_ID,
+            locked = payload.locked,
+            attachments = payload.attachments,
+            tags = TagParser.tagsOf(payload.text),
+        )
+    }.getOrNull()
+
+    /** Every block on one day, oldest first. Used to build a day document. */
+    suspend fun blocksForDay(date: LocalDate): List<JournalEntry> =
+        withContext(Dispatchers.IO) {
+            val key = auth.currentKeyOrNull() ?: return@withContext emptyList()
+            dao.getAll()
+                .filter { it.entryDate == date.toString() }
+                .mapNotNull { decodeRow(key, it) }
+                .sortedWith(compareBy({ it.eventTime }, { it.recordedAt }))
+        }
+
+    // ---------------------------------------------------------------- writing
 
     suspend fun save(
         id: Long?,
@@ -116,6 +132,8 @@ class EntryRepository(
         dao.deleteById(id)
     }
 
+    // --------------------------------------------------------------- photos
+
     suspend fun addAttachment(bytes: ByteArray): String? = withContext(Dispatchers.IO) {
         val key = auth.currentKeyOrNull() ?: return@withContext null
         runCatching { attachments.save(key, bytes) }.getOrNull()
@@ -136,7 +154,7 @@ class EntryRepository(
         attachments.collectGarbage(referenced)
     }
 
-    // ------------------------------------------------------------- notebooks
+    // ------------------------------------------------------------ notebooks
 
     suspend fun notebooks(): NotebookSet = withContext(Dispatchers.IO) {
         notebookStore.load(auth.currentKey())
@@ -146,7 +164,6 @@ class EntryRepository(
         notebookStore.save(auth.currentKey(), set)
     }
 
-    /** Moves every block out of [notebookId] into [fallbackId]. Returns how many moved. */
     suspend fun reassignNotebook(notebookId: Long, fallbackId: Long): Int =
         withContext(Dispatchers.IO) {
             val key = auth.currentKey()
@@ -174,6 +191,31 @@ class EntryRepository(
             changed.size
         }
 
+    // ---------------------------------------------------------------- tasks
+
+    suspend fun tasks(): List<Task> = withContext(Dispatchers.IO) {
+        taskStore.load(auth.currentKey())
+    }
+
+    suspend fun saveTasks(tasks: List<Task>) = withContext(Dispatchers.IO) {
+        taskStore.save(auth.currentKey(), tasks)
+    }
+
+    suspend fun tasksForDay(date: LocalDate): List<Task> =
+        withContext(Dispatchers.IO) {
+            val key = auth.currentKeyOrNull() ?: return@withContext emptyList()
+            taskStore.load(key).filter { task ->
+                task.dueDate == date || completedOn(task, date)
+            }
+        }
+
+    private fun completedOn(task: Task, date: LocalDate): Boolean {
+        val stamp = task.completedAt ?: return false
+        return java.time.Instant.ofEpochMilli(stamp)
+            .atZone(java.time.ZoneId.systemDefault())
+            .toLocalDate() == date
+    }
+
     // ---------------------------------------------------------- password
 
     suspend fun changePassword(current: CharArray, new: CharArray): Boolean {
@@ -182,6 +224,7 @@ class EntryRepository(
         val oldKey = auth.currentKey()
         val rows = dao.getAll()
         val notebooks = notebookStore.load(oldKey)
+        val tasks = taskStore.load(oldKey)
 
         val newSalt = CryptoManager.newSalt()
         val newKey = CryptoManager.deriveKey(new, newSalt)
@@ -194,6 +237,7 @@ class EntryRepository(
 
         database.withTransaction { dao.updateAll(reEncrypted) }
         notebookStore.save(newKey, notebooks)
+        taskStore.save(newKey, tasks)
         auth.replacePassword(newSalt, newKey)
         return true
     }
@@ -236,15 +280,16 @@ class EntryRepository(
         }
 
         val inner = JSONObject()
-        inner.put("version", 4)
+        inner.put("version", 5)
         inner.put("notebooks", encodeNotebooks(notebookStore.load(key)))
+        inner.put("tasks", JSONArray(TaskCodec.encode(taskStore.load(key))))
         inner.put("entries", entriesJson)
 
         val encrypted = CryptoManager.encrypt(key, inner.toString())
 
         val envelope = JSONObject()
         envelope.put("app", "journal")
-        envelope.put("version", 4)
+        envelope.put("version", 5)
         envelope.put("exportedAt", System.currentTimeMillis())
 
         val kdf = JSONObject()
@@ -266,42 +311,66 @@ class EntryRepository(
         rows.size
     }
 
-    suspend fun importFrom(uri: Uri, password: CharArray): Int = withContext(Dispatchers.IO) {
-        val fileText = context.contentResolver.openInputStream(uri)?.use {
-            it.readBytes().toString(Charsets.UTF_8)
-        } ?: error("Could not read that file.")
+    suspend fun importFrom(uri: Uri, password: CharArray): Int =
+        withContext(Dispatchers.IO) {
+            val fileText = context.contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            } ?: error("Could not read that file.")
 
-        val envelope = runCatching { JSONObject(fileText) }
-            .getOrElse { error("That file isn't a readable Journal backup.") }
-        require(envelope.optString("app") == "journal") { "That file isn't a Journal backup." }
+            val envelope = runCatching { JSONObject(fileText) }
+                .getOrElse { error("That file isn't a readable Journal backup.") }
+            require(envelope.optString("app") == "journal") {
+                "That file isn't a Journal backup."
+            }
 
-        val kdf = envelope.getJSONObject("kdf")
-        val cipher = envelope.getJSONObject("cipher")
-        val salt = CryptoManager.decode(kdf.getString("salt"))
-        val iterations = kdf.optInt("iterations", CryptoManager.ITERATIONS)
+            val kdf = envelope.getJSONObject("kdf")
+            val cipher = envelope.getJSONObject("cipher")
+            val salt = CryptoManager.decode(kdf.getString("salt"))
+            val iterations = kdf.optInt("iterations", CryptoManager.ITERATIONS)
 
-        val fileKey = CryptoManager.deriveKey(password, salt, iterations)
-        val inner = runCatching {
-            CryptoManager.decrypt(
-                fileKey,
-                cipher.getString("data"),
-                cipher.getString("iv"),
+            val fileKey = CryptoManager.deriveKey(password, salt, iterations)
+            val inner = runCatching {
+                CryptoManager.decrypt(
+                    fileKey,
+                    cipher.getString("data"),
+                    cipher.getString("iv"),
+                )
+            }.getOrElse { error("Wrong password for this backup, or the file is damaged.") }
+
+            val root = runCatching { JSONObject(inner) }
+                .getOrElse { error("This backup looks corrupted inside.") }
+            val incoming = runCatching { root.getJSONArray("entries") }
+                .getOrElse { error("This backup has no entries in it.") }
+
+            val key = auth.currentKey()
+            val merged = mergeNotebooks(
+                notebookStore.load(key),
+                root.optJSONArray("notebooks"),
             )
-        }.getOrElse { error("Wrong password for this backup, or the file is damaged.") }
+            notebookStore.save(key, merged)
+            val known = merged.notebooks.map { it.id }.toSet()
+            val fallback = merged.displayOrder.firstOrNull()?.id ?: NotebookSet.DEFAULT_ID
 
-        val root = runCatching { JSONObject(inner) }
-            .getOrElse { error("This backup looks corrupted inside.") }
-        val incoming = runCatching { root.getJSONArray("entries") }
-            .getOrElse { error("This backup has no entries in it.") }
+            // Tasks are re-numbered so an imported task can never overwrite one
+            // that is already here.
+            val existingTasks = taskStore.load(key)
+            var nextTaskId = (existingTasks.maxOfOrNull { it.id } ?: 0L) + 1L
+            val importedTasks = runCatching {
+                TaskCodec.decode(root.optJSONArray("tasks")?.toString() ?: "[]")
+            }.getOrDefault(emptyList()).map { task ->
+                val fresh = task.copy(
+                    id = nextTaskId,
+                    notebookId = if (task.notebookId in known) task.notebookId else fallback,
+                )
+                nextTaskId += 1L
+                fresh
+            }
+            if (importedTasks.isNotEmpty()) {
+                taskStore.save(key, existingTasks + importedTasks)
+            }
 
-        val key = auth.currentKey()
-        val merged = mergeNotebooks(notebookStore.load(key), root.optJSONArray("notebooks"))
-        notebookStore.save(key, merged)
-        val known = merged.notebooks.map { it.id }.toSet()
-        val fallback = merged.displayOrder.firstOrNull()?.id ?: NotebookSet.DEFAULT_ID
-
-        val now = System.currentTimeMillis()
-        val rows = buildList {
+            val now = System.currentTimeMillis()
+            val rows = mutableListOf<Entry>()
             for (i in 0 until incoming.length()) {
                 val item = incoming.optJSONObject(i) ?: continue
                 val date = runCatching { LocalDate.parse(item.getString("date")) }
@@ -309,8 +378,9 @@ class EntryRepository(
                 val text = item.optString("text")
                 if (text.isBlank()) continue
 
-                val valence = if (item.has("valence") && !item.isNull("valence"))
-                    item.optInt("valence").coerceIn(MoodScale.MIN, MoodScale.MAX) else null
+                val valence = if (item.has("valence") && !item.isNull("valence")) {
+                    item.optInt("valence").coerceIn(MoodScale.MIN, MoodScale.MAX)
+                } else null
                 val custom = item.optString("customMood")
                     .takeIf { it.isNotBlank() && !item.isNull("customMood") }
                 val recordedAt = item.optLong("recordedAt", now)
@@ -318,16 +388,15 @@ class EntryRepository(
                 val notebook = item.optLong("notebook", 0L).takeIf { it in known }
 
                 val photos = item.optJSONArray("attachments")
-                val names = buildList {
-                    if (photos != null) {
-                        for (p in 0 until photos.length()) {
-                            val photo = photos.optJSONObject(p) ?: continue
-                            val bytes = runCatching {
-                                CryptoManager.decode(photo.getString("data"))
-                            }.getOrNull() ?: continue
-                            runCatching { attachments.save(key, bytes) }
-                                .getOrNull()?.let { add(it) }
-                        }
+                val names = mutableListOf<String>()
+                if (photos != null) {
+                    for (p in 0 until photos.length()) {
+                        val photo = photos.optJSONObject(p) ?: continue
+                        val bytes = runCatching {
+                            CryptoManager.decode(photo.getString("data"))
+                        }.getOrNull() ?: continue
+                        runCatching { attachments.save(key, bytes) }
+                            .getOrNull()?.let { names += it }
                     }
                 }
 
@@ -346,21 +415,18 @@ class EntryRepository(
                     ),
                 )
 
-                add(
-                    Entry(
-                        entryDate = date.toString(),
-                        createdAt = recordedAt,
-                        updatedAt = item.optLong("updatedAt", now),
-                        cipherText = encrypted.cipherText,
-                        iv = encrypted.iv,
-                    )
+                rows += Entry(
+                    entryDate = date.toString(),
+                    createdAt = recordedAt,
+                    updatedAt = item.optLong("updatedAt", now),
+                    cipherText = encrypted.cipherText,
+                    iv = encrypted.iv,
                 )
             }
-        }
 
-        if (rows.isNotEmpty()) dao.insertAll(rows)
-        rows.size
-    }
+            if (rows.isNotEmpty()) dao.insertAll(rows)
+            rows.size
+        }
 
     private fun encodeNotebooks(set: NotebookSet): JSONArray {
         val array = JSONArray()
