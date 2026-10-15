@@ -17,10 +17,10 @@ jobs:
       - name: Check what still needs doing
         id: check
         run: |
-          if [ -f .on-this-day-applied ]; then
-            echo "patch=false" >> "$GITHUB_OUTPUT"
+          if [ -f .ond-fix-applied ]; then
+            echo "fix=false" >> "$GITHUB_OUTPUT"
           else
-            echo "patch=true" >> "$GITHUB_OUTPUT"
+            echo "fix=true" >> "$GITHUB_OUTPUT"
           fi
           if [ -f .workflows-consolidated ]; then
             echo "tidy=false" >> "$GITHUB_OUTPUT"
@@ -28,8 +28,8 @@ jobs:
             echo "tidy=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Rewrite the on-this-day logic
-        if: steps.check.outputs.patch == 'true'
+      - name: Fix the On this day section
+        if: steps.check.outputs.fix == 'true'
         run: |
           set -e
           PKG=app/src/main/java/com/example/journal/ui
@@ -37,6 +37,23 @@ jobs:
           cat > "$PKG/OnThisDay.kt" <<'KOTLIN'
           package com.example.journal.ui
 
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
           import com.example.journal.data.JournalEntry
           import com.example.journal.data.MoodScale
           import com.example.journal.data.NotebookSet
@@ -44,8 +61,8 @@ jobs:
           import kotlin.math.roundToInt
 
           /**
-           * One remembered day, not one remembered section. A day with five sections used
-           * to produce five cards; it now produces a single quiet line.
+           * One remembered day, not one remembered section. A day with five sections used to
+           * produce five cards; it now produces a single quiet line.
            */
           data class OnThisDayHit(
               val label: String,
@@ -102,8 +119,8 @@ jobs:
           }
 
           /**
-           * Deliberately quiet: a heading that folds away, then at most three single-line
-           * rows. It occupies about the height of one old card however much you wrote.
+           * Deliberately quiet: a heading that folds away, then at most three single-line rows.
+           * It occupies about the height of one old card however much you wrote that day.
            */
           @Composable
           fun OnThisDaySection(
@@ -191,62 +208,68 @@ jobs:
           }
           KOTLIN
 
-          echo "Wrote OnThisDay.kt"
-
           python3 - <<'PY'
           import sys
 
-          path = "app/src/main/java/com/example/journal/ui/JournalListScreen.kt"
-          src = open(path, encoding="utf-8").read()
-
-          if "OnThisDaySection(" in src:
-              print("JournalListScreen.kt is already patched.")
-              sys.exit(0)
-
-          marker = "if (hits.isNotEmpty()) {"
-          count = src.count(marker)
-          print("hits blocks found:", count)
-          if count != 1:
-              print("ERROR: expected exactly one hits block")
-              sys.exit(1)
-
+          screen = "app/src/main/java/com/example/journal/ui/JournalListScreen.kt"
+          src = open(screen, encoding="utf-8").read()
           lines = src.split("\n")
-          start = next(i for i, l in enumerate(lines) if marker in l)
 
-          depth = 0
-          end = None
-          for j in range(start, len(lines)):
-              depth += lines[j].count("{") - lines[j].count("}")
-              if depth == 0:
-                  end = j
-                  break
+          # 1. An earlier patch injected this block with too much indentation, because the
+          #    replacement strings carried their own leading spaces. Normalise it.
+          target = None
+          for i, line in enumerate(lines):
+              if line.strip() == "if (hits.isNotEmpty()) {":
+                  if "OnThisDaySection(" in "\n".join(lines[i:i + 8]):
+                      target = i
+                      break
 
-          if end is None:
-              print("ERROR: unbalanced braces while locating the block")
-              sys.exit(1)
+          if target is None:
+              print("Note: the On this day block was not found; nothing to normalise.")
+          else:
+              depth = 0
+              end = None
+              for j in range(target, len(lines)):
+                  depth += lines[j].count("{") - lines[j].count("}")
+                  if depth == 0:
+                      end = j
+                      break
+              if end is None:
+                  print("ERROR: unbalanced braces around the On this day block")
+                  sys.exit(1)
+              replacement = [
+                  "        if (hits.isNotEmpty()) {",
+                  "            Spacer(Modifier.height(10.dp))",
+                  "            OnThisDaySection(",
+                  "                hits = hits,",
+                  "                moodScale = moodScale,",
+                  "                onOpenDay = onOpenDay,",
+                  "            )",
+                  "        }",
+              ]
+              lines = lines[:target] + replacement + lines[end + 1:]
+              src = "\n".join(lines)
+              print("Normalised the On this day block (lines %d..%d)." % (target + 1, end + 1))
 
-          print("Replacing lines %d..%d" % (start + 1, end + 1))
+          # 2. A hidden section must not inflate a day card's word count either.
+          old = "val words = group.blocks.sumOf { countWords(it.text) }"
+          new = "val words = group.blocks.filterNot { it.locked }.sumOf { countWords(it.text) }"
+          if old in src:
+              src = src.replace(old, new, 1)
+              print("Day card word count now excludes hidden sections.")
+          elif new in src:
+              print("Day card word count already excludes hidden sections.")
+          else:
+              print("Note: the day card word count line was not found; left as is.")
 
-          replacement = [
-              "        if (hits.isNotEmpty()) {",
-              "            Spacer(Modifier.height(10.dp))",
-              "            OnThisDaySection(",
-              "                hits = hits,",
-              "                moodScale = moodScale,",
-              "                onOpenDay = onOpenDay,",
-              "            )",
-              "        }",
-          ]
-
-          out = lines[:start] + replacement + lines[end + 1:]
-          open(path, "w", encoding="utf-8").write("\n".join(out))
-          print("Patched JournalListScreen.kt")
+          open(screen, "w", encoding="utf-8").write(src)
+          print("JournalListScreen.kt saved.")
           PY
 
-          sed -i 's/versionName = "0.2.0"/versionName = "0.2.1"/' app/build.gradle.kts
+          sed -i 's/versionName = "0.2.1"/versionName = "0.2.2"/' app/build.gradle.kts
           grep -n 'versionName' app/build.gradle.kts
 
-          printf 'The on-this-day section has been rewritten.\n' > .on-this-day-applied
+          printf 'Corrected the On this day section and the hidden-block word count.\n' > .ond-fix-applied
 
       - name: Consolidate down to one workflow
         if: steps.check.outputs.tidy == 'true'
@@ -268,7 +291,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "On this day: one quiet line per day, and one workflow"
+            git commit -m "Fix the On this day section and quieten hidden blocks"
             git push origin HEAD:${GITHUB_REF_NAME}
           fi
 
@@ -325,13 +348,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           APK=app/build/outputs/apk/debug/app-debug.apk
-          TAG="v0.2.1-$(date -u +%Y%m%d-%H%M)"
+          TAG="v0.2.2-$(date -u +%Y%m%d-%H%M)"
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" "$APK" --clobber
           else
             gh release create "$TAG" "$APK" \
-              --title "Journal 0.2.1 ($(date -u +%Y-%m-%d))" \
-              --notes "Day documents with sections, notebook tabs, tasks, and a much quieter On this day strip."
+              --title "Journal 0.2.2 ($(date -u +%Y-%m-%d))" \
+              --notes "Quieter On this day strip, correct imports, hidden blocks no longer counted."
           fi
           if gh release view apk-latest > /dev/null 2>&1; then
             gh release upload apk-latest "$APK" --clobber
@@ -340,3 +363,16 @@ jobs:
               --title "Latest build" \
               --notes "Always the newest APK."
           fi
+
+      - name: Keep only the ten newest dated releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 200 --json tagName,createdAt \
+            -q '[.[] | select(.tagName | startswith("v0."))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            | while read -r old; do
+                if [ -n "$old" ]; then
+                  echo "pruning $old"
+                  gh release delete "$old" --yes --cleanup-tag > /dev/null 2>&1 || true
+                fi
+              done
