@@ -372,7 +372,7 @@ private fun DayCard(
     showNotebooks: Boolean,
     onOpen: () -> Unit,
 ) {
-    val words = group.blocks.sumOf { countWords(it.text) }
+    val words = group.blocks.filterNot { it.locked }.sumOf { countWords(it.text) }
     val valences = group.blocks.filterNot { it.locked }.mapNotNull { it.valence }
     val mood = if (valences.isEmpty()) null
     else scale.emojiFor(
