@@ -23,6 +23,7 @@ import com.example.journal.ui.computeMoodSeries
 import com.example.journal.ui.computeOnThisDay
 import com.example.journal.ui.computeStats
 import com.example.journal.ui.decodeSampled
+import com.example.journal.ui.shortLabel
 import com.example.journal.ui.withCurrentTimeOfDay
 import com.example.journal.widget.JournalWidget
 import com.example.journal.work.ReminderScheduler
