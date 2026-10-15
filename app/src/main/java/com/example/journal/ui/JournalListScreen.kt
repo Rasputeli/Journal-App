@@ -315,39 +315,12 @@ private fun OverviewCard(
         }
 
         if (hits.isNotEmpty()) {
-            Spacer(Modifier.height(14.dp))
-            Text(
-                text = "On this day",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.primary,
+            Spacer(Modifier.height(10.dp))
+            OnThisDaySection(
+                hits = hits,
+                moodScale = moodScale,
+                onOpenDay = onOpenDay,
             )
-            hits.forEach { hit ->
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 6.dp)
-                        .clickable {
-                            onOpenDay(hit.entry.date, hit.entry.notebookId)
-                        },
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Text(
-                            text = hit.label,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            text = if (hit.entry.locked) "Hidden section"
-                            else hit.entry.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
         }
     }
 }
